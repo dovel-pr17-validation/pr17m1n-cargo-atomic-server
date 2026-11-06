@@ -1,0 +1,10 @@
+- [Decentralized Identifiers](did.md): `atomic:` identifiers name Resources, Agents, Commits, blobs and nodes independently of where they are hosted. See also [URLs and identifiers](urls.md).
+- [Agents](agents.md) are Users that enable [authentication](authentication.md). An Agent is an Ed25519 keypair; its identifier is derived from the public key, so nobody has to issue it.
+- [Hierarchies](hierarchy.md) used for authorization and keeping data organized. Similar to folder structures on file-systems. Rights are checked on every device and every transport.
+- [Invites](invitations.md): create new users and provide them with rights.
+- [Atomic Sync](sync.md): how devices reconcile their copies of a Drive, offline edits included, over WebSocket, Iroh or WebRTC.
+- [Commits](commits/intro.md): the signed envelope around every write. They prove who changed what; current state and history live in each Resource's CRDT document.
+- [Collections](schema/collections.md): querying, filtering, sorting and pagination.
+- [Paths](core/paths.md): traverse graphs.
+- [Endpoints](endpoints.md): provide machine-readable descriptions of web services.
+- [Files](files.md): upload, download and metadata for files.

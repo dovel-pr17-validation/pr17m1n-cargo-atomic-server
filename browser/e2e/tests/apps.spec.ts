@@ -1,0 +1,645 @@
+import { readFileSync } from 'node:fs';
+import { resolve } from 'node:path';
+import { test, expect } from '@playwright/test';
+import { createFromCatalog, before, waitForSynced } from './test-utils';
+
+/**
+ * The one thing about apps that only a browser can answer.
+ *
+ * Everything underneath has cheaper tests: the token's scope and expiry, the
+ * subtree rule, what `createApp` builds, that a write is signed by the app and
+ * refused outside it — all unit or handler tests. What none of them can reach
+ * is whether a null-origin iframe actually loads the module the server served,
+ * renders it, and can talk back through postMessage well enough to write.
+ *
+ * So this walks exactly that: make an app, open it, click the thing, see the
+ * data. If this passes, the whole chain is connected.
+ */
+test.describe('apps', () => {
+  test.beforeEach(before);
+
+  for (const client of ['served', 'v1 fixture'] as const) {
+    test(`an app renders in its frame and writes its own data (${client})`, async ({
+      page,
+    }) => {
+      let fixtureServed = false;
+
+      if (client === 'v1 fixture') {
+        // Exercise this checkout's embedded SDK even when the dev server binary
+        // predates it. Only the JS asset is replaced; all writes use the server.
+        const body = readFileSync(
+          resolve(
+            __dirname,
+            '../../data-browser/src/chunks/AppPage/viewClient.js',
+          ),
+          'utf8',
+        );
+        await page.route(
+          url =>
+            url.pathname === '/plugin-ui' &&
+            url.searchParams.get('format') === 'client',
+          route => {
+            fixtureServed = true;
+
+            return route.fulfill({
+              body,
+              contentType: 'application/javascript',
+              headers: { 'Access-Control-Allow-Origin': '*' },
+            });
+          },
+        );
+      }
+
+      const main = page.getByRole('main');
+
+      // `New app` is search-only: it creates the drive's plugin schema on first
+      // use, so it stays out of the default listing.
+      // An app page is the app: no chrome of its own, just the frame.
+      await newApp(page);
+
+      // And the frame is the page. An iframe never grows to fit its document,
+      // so a box shorter than the page does not scroll — it clips the app and
+      // leaves dead space underneath. Only the container's own padding should
+      // sit between the bottom of the frame and the bottom of the page.
+      const pageBox = (await main.boundingBox())!;
+      const frameBox = (await main
+        .locator('iframe[title="App"]')
+        .boundingBox())!;
+      expect(frameBox.y + frameBox.height).toBeGreaterThan(
+        pageBox.y + pageBox.height - 48,
+      );
+
+      // Null-origin, so Playwright reaches it as a frame rather than through
+      // the parent's DOM — which is the isolation doing its job.
+      const app = page.frameLocator('iframe[title="App"]');
+
+      await expect(app.getByRole('heading', { name: 'New app' })).toBeVisible();
+
+      const add = app.getByRole('button', { name: 'Add an item' });
+      await expect(add).toBeVisible();
+
+      // The click is the whole chain: the app's code calls store.newResource,
+      // that crosses postMessage to the host, the host asks the server to write
+      // as the app, and the app re-reads what landed.
+      await add.click();
+      await expect(app.getByRole('listitem').first()).toBeVisible();
+
+      await add.click();
+      await expect(app.getByRole('listitem')).toHaveCount(2);
+      if (client === 'v1 fixture') expect(fixtureServed).toBe(true);
+    });
+  }
+
+  test('rows an app adds are in its table, editable without the app', async ({
+    page,
+  }) => {
+    const main = page.getByRole('main');
+
+    await newApp(page);
+
+    const app = page.frameLocator('iframe[title="App"]');
+    await app.getByRole('button', { name: 'Add an item' }).click();
+    await expect(app.getByRole('listitem')).toHaveCount(1);
+
+    // The app's rows are a table's rows. Opening that table gives the full
+    // table UI — which is the point of not having the app draw a list:
+    // sorting, filtering and editing come from the table, not from the app.
+    const sidebar = page.getByRole('navigation').last();
+    await sidebar
+      .locator('[data-sidebar-id]')
+      .filter({
+        has: page.getByRole('button', { name: 'New app', exact: true }),
+      })
+      .getByRole('button', { name: 'Expand folder' })
+      .click();
+    await sidebar.getByRole('button', { name: 'Items', exact: true }).click();
+
+    // The table renders the row the app made, with the table's own UI around
+    // it — nothing the app implemented.
+    await expect(main.getByText('Item 1')).toBeVisible();
+  });
+
+  test('an app can be a view on a table, beside the table view', async ({
+    page,
+  }) => {
+    const main = page.getByRole('main');
+
+    await newApp(page);
+
+    // Open the app's own table and add the app as a second way to see it.
+    const sidebar = page.getByRole('navigation').last();
+    await sidebar
+      .locator('[data-sidebar-id]')
+      .filter({
+        has: page.getByRole('button', { name: 'New app', exact: true }),
+      })
+      .getByRole('button', { name: 'Expand folder' })
+      .click();
+    await sidebar.getByRole('button', { name: 'Items', exact: true }).click();
+    await expect(main.getByRole('tablist')).toBeVisible();
+
+    await main.getByRole('button', { name: 'Add view' }).click();
+    await page.getByRole('menuitem', { name: 'New app' }).click();
+
+    // The app now renders these rows, in a tab of its own...
+    await expect(main.locator('iframe[title="App"]')).toBeVisible();
+
+    // ...and the table is still right there. Adding a way to look at rows
+    // must never take one away.
+    await main.getByRole('tab', { name: 'Table' }).click();
+    await expect(main.locator('iframe[title="App"]')).toBeHidden();
+  });
+
+  test('an app survives a reload, because its data is in the drive', async ({
+    page,
+  }) => {
+    await newApp(page);
+
+    const app = page.frameLocator('iframe[title="App"]');
+    await app.getByRole('button', { name: 'Add an item' }).click();
+    await expect(app.getByRole('listitem')).toHaveCount(1);
+
+    // `toHaveCount(1)` above is the app's own render, which happens before the
+    // write reaches the server. Reloading on top of that is a race, and under
+    // load this test lost it every time: four local Playwright workers, and the
+    // item is gone after the reload and never arrives, still 0 with the
+    // assertion given 120s. The suite waits for the outbox before a reload in
+    // 24 other files; this one did not.
+    await waitForSynced(page);
+
+    // Atomic is the persistence layer: nothing about the app is in the page.
+    await page.reload();
+
+    const reopened = page.frameLocator('iframe[title="App"]');
+    // Include cold database recovery and the bridge's bounded request wait.
+    await expect(reopened.getByRole('listitem')).toHaveCount(1, {
+      timeout: 60_000,
+    });
+  });
+
+  test('a failed app key handover recovers after reload without reinstalling', async ({
+    page,
+  }) => {
+    let blocked = true;
+    let attempts = 0;
+    await page.route('**/app-agent', route => {
+      if (route.request().method() === 'POST' && blocked) {
+        attempts += 1;
+
+        return route.abort('connectionfailed');
+      }
+
+      return route.continue();
+    });
+    await newApp(page);
+    await expect.poll(() => attempts).toBeGreaterThan(0);
+    await waitForSynced(page);
+    const beforeReload = attempts;
+    await page.reload();
+    // This request can only be recovered from the encrypted IDB record. The
+    // installation function that minted the key is gone after a reload.
+    await expect
+      .poll(() => attempts, { timeout: 30_000 })
+      .toBeGreaterThan(beforeReload);
+    const frame = page.locator('iframe[title="App"]');
+    await expect(frame).toBeVisible();
+    const previousFrame = await frame.elementHandle();
+    const recovered = page.waitForResponse(
+      response =>
+        new URL(response.url()).pathname === '/app-agent' &&
+        response.request().method() === 'POST' &&
+        response.ok(),
+    );
+    blocked = false;
+    await recovered;
+    await expect
+      .poll(() => previousFrame!.evaluate(element => element.isConnected))
+      .toBe(false);
+
+    // Recovery remounts the affected frame; the user never reinstalls the app.
+    const app = page.frameLocator('iframe[title="App"]');
+    await app.getByRole('button', { name: 'Add an item' }).click();
+    await expect(app.getByRole('listitem')).toHaveCount(1);
+    await waitForSynced(page);
+    await page.reload();
+    await expect(
+      page.frameLocator('iframe[title="App"]').getByRole('listitem'),
+    ).toHaveCount(1);
+  });
+
+  test('an app that breaks says so, and offers to have it fixed', async ({
+    page,
+  }) => {
+    const main = page.getByRole('main');
+
+    await newApp(page);
+
+    // Break it. The frame is null-origin, so its console belongs to nobody —
+    // without a report crossing the boundary this is a blank panel and the
+    // person who could fix it never learns there was anything to fix.
+    await setAppSource(
+      page,
+      'export function view() { throw new Error("kaboom"); }',
+    );
+    await page.reload();
+
+    const alert = main.getByRole('alert');
+    await expect(alert).toContainText('kaboom');
+
+    // The whole point of reporting it: somewhere to go next.
+    await expect(alert.getByRole('button', { name: 'Fix it' })).toBeVisible();
+  });
+
+  test("an app uses the host's own confirm, menu and shortcuts", async ({
+    page,
+  }) => {
+    await newApp(page);
+    await setAppSource(page, HOST_UI_APP);
+    await page.reload();
+
+    const app = page.frameLocator('iframe[title="App"]');
+    const said = app.getByRole('status');
+    await expect(app.getByRole('button', { name: 'Delete' })).toBeVisible({
+      timeout: 60_000,
+    });
+
+    // A confirm the host draws, named after the app, not a bare confirm().
+    await app.getByRole('button', { name: 'Delete' }).click();
+    const dialog = page.getByRole('dialog');
+    await expect(
+      dialog.getByRole('heading', { name: 'Delete this item?' }),
+    ).toBeVisible();
+    await expect(dialog).toContainText('Asked by');
+    await dialog.getByRole('button', { name: 'Cancel' }).click();
+    await expect(said).toHaveText('kept');
+
+    await app.getByRole('button', { name: 'Delete' }).click();
+    await page
+      .getByRole('dialog')
+      .getByRole('button', { name: 'Confirm' })
+      .click();
+    await expect(said).toHaveText('confirmed');
+
+    // A menu at the click, drawn by the host so it is not clipped by the frame.
+    await app.getByRole('button', { name: 'Options' }).click();
+    await page.getByRole('menuitem', { name: 'Rename' }).click();
+    await expect(said).toHaveText('chose rename');
+
+    // Dismissing answers null rather than leaving the app waiting.
+    await app.getByRole('button', { name: 'Options' }).click();
+    await expect(page.getByRole('menuitem', { name: 'Rename' })).toBeVisible();
+    await page.keyboard.press('Escape');
+    await expect(said).toHaveText('chose null');
+
+    // A key the app leaves alone reaches the host's own key listeners, as if
+    // pressed on the frame. Checked at the listener rather than through a
+    // Ctrl shortcut: on the CI runner a Ctrl chord opens nothing even
+    // outside a frame, so the shortcut would test the runner, not this.
+    await page.evaluate(() => {
+      const w = window as unknown as { hostKeys: string[] };
+      w.hostKeys = [];
+      document.addEventListener('keydown', e => {
+        if ((e.target as Element | null)?.tagName === 'IFRAME')
+          w.hostKeys.push(e.key);
+      });
+    });
+    await app.getByRole('button', { name: 'Options' }).focus();
+    await page.keyboard.press('Escape');
+    await expect
+      .poll(() =>
+        page.evaluate(
+          () => (window as unknown as { hostKeys: string[] }).hostKeys,
+        ),
+      )
+      .toContain('Escape');
+  });
+
+  test("an app asks through the host's form and pickers, and queries sorted", async ({
+    page,
+  }) => {
+    await newApp(page);
+    await setAppSource(page, PICKERS_APP);
+    await page.reload();
+
+    const app = page.frameLocator('iframe[title="App"]');
+    const said = app.getByRole('status');
+    await expect(app.getByRole('button', { name: 'New row' })).toBeVisible({
+      timeout: 60_000,
+    });
+
+    await app.getByRole('button', { name: 'Add Apple' }).click();
+    await expect(said).toHaveText('added Apple');
+
+    // Atomic's own form for the app's row class, prefilled by the app and
+    // saved by the person.
+    await app.getByRole('button', { name: 'New row' }).click();
+    const form = page.getByRole('dialog');
+    await expect(form.getByRole('textbox').first()).toHaveValue('Zebra');
+    await form.getByRole('button', { name: 'Save' }).click();
+    await expect(said).toHaveText('made a row');
+
+    // A Store-shaped query: the app's rows, sorted by name, newest call wins.
+    await app.getByRole('button', { name: 'List' }).click();
+    await expect(said).toHaveText('Apple, Zebra', { timeout: 20_000 });
+
+    // The pickers answer null when the person backs out.
+    await app.getByRole('button', { name: 'Pick' }).click();
+    const picker = page.getByRole('dialog');
+    await expect(
+      picker.getByRole('heading', { name: 'Choose a row' }),
+    ).toBeVisible();
+    await expect(picker).toContainText('Asked by');
+    await picker.getByRole('button', { name: 'Cancel' }).click();
+    await expect(said).toHaveText('picked null');
+
+    await app.getByRole('button', { name: 'File' }).click();
+    await expect(page.getByRole('dialog')).toBeVisible();
+    await page.keyboard.press('Escape');
+    await expect(said).toHaveText('file null');
+  });
+
+  test('an app makes several writes as one change, and undoes it', async ({
+    page,
+  }) => {
+    await newApp(page);
+    await setAppSource(page, APPLY_APP);
+    await page.reload();
+
+    const app = page.frameLocator('iframe[title="App"]');
+    const said = app.getByRole('status');
+    await expect(
+      app.getByRole('button', { name: 'Apply', exact: true }),
+    ).toBeVisible({
+      timeout: 60_000,
+    });
+
+    // Two linked rows in one call: the second points at the first.
+    await app.getByRole('button', { name: 'Apply', exact: true }).click();
+    await expect(said).toHaveText('2 rows, linked', {
+      timeout: 20_000,
+    });
+
+    // A bad value anywhere means nothing is written.
+    await app.getByRole('button', { name: 'Bad apply' }).click();
+    await expect(said).toContainText('refused, still 2 rows', {
+      timeout: 20_000,
+    });
+
+    await app.getByRole('button', { name: 'Undo' }).click();
+    await expect(said).toHaveText('undone, 0 rows', {
+      timeout: 20_000,
+    });
+  });
+});
+
+/**
+ * Asks for a new app and waits for its frame.
+ *
+ * The first app on a drive materializes that drive's plugin schema before
+ * anything can render: `createApp` calls `ensureSchema(pluginSchema())`, which
+ * is nineteen properties and classes, each its own resource. The browser sends
+ * those writes together, but the server applies commits one at a time, so the
+ * step costs what nineteen sequential writes cost. That is the same wait
+ * `newPlugin` in plugins.spec.ts documents: measured against a debug build,
+ * 5.2s on a fresh store and around 11s once the suite's shared store holds a
+ * handful of drives, which is where this spec runs. The suite's 10s default
+ * was never a budget this step could meet on CI hardware, and it is what made
+ * every test in this file fail there while passing on a clean laptop.
+ *
+ * So the wait is widened here rather than for the whole suite, and the test
+ * gets room for the part that comes after it. The wait is the symptom; making
+ * the schema cheaper to create is its own change.
+ */
+async function newApp(page: import('@playwright/test').Page) {
+  // `test.setTimeout` applies to the RUNNING TEST, not to the function it is
+  // written in, so a bare call here would overwrite whatever the caller asked
+  // for, downward and without an error. `newPlugin` in `plugins.spec.ts` was
+  // the same shape and did exactly that: its sidebar test declared 240s two
+  // lines before calling it, ran on 120s, and died at a wall it had itself
+  // raised. Nothing in this file declares a budget today, which is the only
+  // reason this one was harmless, and that stops being true the first time
+  // someone adds one.
+  //
+  // So raise, never lower. Playwright uses 0 for "no timeout", so that case is
+  // left alone rather than handed a ceiling it deliberately removed; a bare
+  // `Math.max` here would be the same bug pointing the other way.
+  const currentTimeout = test.info().timeout;
+
+  // 180s, raised with `createFromCatalog`'s own ceiling. That step may now
+  // wait 90s and the frame below it another 45s, so a 120s wall could expire
+  // while a budget underneath it still had room — and a wall failure names
+  // whichever assertion happened to be in flight, not the step that ran long.
+  // The wall has to stay above what the budgets under it can spend, or they
+  // cannot fire and say so themselves.
+  if (currentTimeout !== 0 && currentTimeout < 180000) test.setTimeout(180000);
+  await createFromCatalog(page, 'App');
+  await expect(
+    page.getByRole('main').locator('iframe[title="App"]'),
+  ).toBeVisible({ timeout: 45000 });
+}
+
+/**
+ * Replaces the source of the app on screen, through `window.store`.
+ *
+ * The entry point is a child of the app and the source property is drive-local
+ * with no fixed subject, so both are found by value rather than by a path this
+ * test would then have to keep up with.
+ */
+async function setAppSource(
+  page: import('@playwright/test').Page,
+  source: string,
+) {
+  await page.evaluate(async (next: string) => {
+    const store = (
+      window as unknown as {
+        store: {
+          getResource(s: string): Promise<{
+            getPropVals(): Record<string, unknown>;
+            set(p: string, v: unknown): Promise<void>;
+            save(): Promise<unknown>;
+          }>;
+        };
+      }
+    ).store;
+
+    const subject = decodeURIComponent(
+      new URL(location.href).searchParams.get('subject')!,
+    );
+    const app = await store.getResource(subject);
+
+    for (const value of Object.values(app.getPropVals())) {
+      if (typeof value !== 'string' || !value.includes(':')) continue;
+
+      const child = await store.getResource(value).catch(() => undefined);
+
+      if (!child) continue;
+
+      const sourceProp = Object.entries(child.getPropVals()).find(
+        ([, v]) =>
+          typeof v === 'string' && v.includes('export async function view'),
+      )?.[0];
+
+      if (!sourceProp) continue;
+
+      await child.set(sourceProp, next);
+      await child.save();
+
+      return;
+    }
+
+    throw new Error('could not find the app’s entry point');
+  }, source);
+}
+
+/**
+ * An app that asks the host for UI and says what came back, so the test can
+ * read the answer from inside the frame.
+ */
+const HOST_UI_APP = `export async function view({ root, store }) {
+  const said = document.createElement('p');
+  said.setAttribute('role', 'status');
+  const button = (label, onClick) => {
+    const b = document.createElement('button');
+    b.textContent = label;
+    b.addEventListener('click', onClick);
+    root.append(b);
+  };
+  button('Delete', async () => {
+    const ok = await store.ui.confirm({
+      title: 'Delete this item?',
+      body: 'It goes to the trash.',
+      danger: true,
+    });
+    said.textContent = ok ? 'confirmed' : 'kept';
+  });
+  button('Options', async event => {
+    const id = await store.ui.menu({
+      at: event,
+      items: [
+        { id: 'rename', label: 'Rename' },
+        { id: 'duplicate', label: 'Duplicate' },
+      ],
+    });
+    said.textContent = 'chose ' + id;
+  });
+  root.append(said);
+}`;
+
+const PICKERS_APP = `export async function view({ root, store }) {
+  const name = 'https://atomicdata.dev/properties/name';
+  const parent = 'https://atomicdata.dev/properties/parent';
+  const { table, rowClass } = await store.getData();
+  const said = document.createElement('p');
+  said.setAttribute('role', 'status');
+  const button = (label, onClick) => {
+    const b = document.createElement('button');
+    b.textContent = label;
+    b.addEventListener('click', onClick);
+    root.append(b);
+  };
+  // Made on a click, not when the view starts: the host can start a view twice
+  // while the page settles, and every start would add its own Apple.
+  button('Add Apple', async () => {
+    await store.newResource({
+      parent: table,
+      isA: [rowClass],
+      propVals: { [name]: 'Apple' },
+    });
+    said.textContent = 'added Apple';
+  });
+  button('New row', async () => {
+    const made = await store.ui.form({
+      class: rowClass,
+      parent: table,
+      propVals: { [name]: 'Zebra' },
+    });
+    said.textContent = made ? 'made a row' : 'no row';
+  });
+  button('List', async () => {
+    try {
+      // The index catches up just after a write; ask until both rows are in.
+      let rows = [];
+      for (let i = 0; i < 20; i++) {
+        rows = await store.query({
+          property: parent,
+          value: table,
+          sortBy: name,
+          pageSize: 10,
+          page: 0,
+        });
+        if (rows.length === 2) break;
+        await new Promise(r => setTimeout(r, 500));
+      }
+      const titles = [];
+      for (const row of rows) titles.push((await store.getResource(row)).get(name));
+      said.textContent = titles.join(', ');
+    } catch (e) {
+      said.textContent = 'list failed: ' + e.message;
+    }
+  });
+  button('Pick', async () => {
+    said.textContent = 'picked ' + (await store.ui.pickResource({ isA: rowClass, title: 'Choose a row' }));
+  });
+  button('File', async () => {
+    said.textContent = 'file ' + (await store.ui.pickFile({ accept: ['image/*'] }));
+  });
+  root.append(said);
+}`;
+
+const APPLY_APP = `export async function view({ root, store }) {
+  const name = 'https://atomicdata.dev/properties/name';
+  const parent = 'https://atomicdata.dev/properties/parent';
+  const description = 'https://atomicdata.dev/properties/description';
+  const { table, rowClass } = await store.getData();
+  const said = document.createElement('p');
+  said.setAttribute('role', 'status');
+  // The table's index catches up just after a write; ask until it says
+  // what we expect, or give its last answer.
+  const rows = async expected => {
+    let found = [];
+    for (let i = 0; i < 20; i++) {
+      found = await store.query({ property: parent, value: table });
+      if (found.length === expected) break;
+      await new Promise(r => setTimeout(r, 500));
+    }
+    return found;
+  };
+  const button = (label, onClick) => {
+    const b = document.createElement('button');
+    b.textContent = label;
+    b.addEventListener('click', onClick);
+    root.append(b);
+  };
+  button('Apply', async () => {
+    try {
+      const { subjects } = await store.apply([
+        { op: 'create', localId: 'a', parent: table, isA: [rowClass], set: { [name]: 'First' } },
+        { op: 'create', localId: 'b', parent: table, isA: [rowClass], set: { [name]: 'Second', [description]: 'local:a' } },
+      ]);
+      const second = await store.getResource(subjects.b);
+      said.textContent = (await rows(2)).length + ' rows, ' + (second.get(description) === subjects.a ? 'linked' : 'not linked');
+    } catch (e) {
+      said.textContent = 'apply failed: ' + e.message;
+    }
+  });
+  button('Bad apply', async () => {
+    try {
+      await store.apply([
+        { op: 'create', localId: 'c', parent: table, isA: [rowClass], set: { [name]: 'Third' } },
+        { op: 'sudo', subject: table },
+      ]);
+      said.textContent = 'applied';
+    } catch (e) {
+      said.textContent = 'refused, still ' + (await rows(2)).length + ' rows';
+    }
+  });
+  button('Undo', async () => {
+    try {
+      const undone = await store.undo();
+      said.textContent = (undone ? 'undone, ' : 'nothing, ') + (await rows(0)).length + ' rows';
+    } catch (e) {
+      said.textContent = 'undo failed: ' + e.message;
+    }
+  });
+  root.append(said);
+}`;

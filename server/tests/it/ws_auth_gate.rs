@@ -1,0 +1,741 @@
+//! Integration tests for the WebSocket trust gates: which frames need an
+//! AUTH first, that a subscription without read rights is refused out loud,
+//! and that a refused SYNC_PUSH is answered with an ERROR and never with
+//! SYNC_OK.
+//!
+//! Every refusal here used to be silent (a dropped frame, or a `SYNC_OK`
+//! for an import that never happened). These tests pin the *visible*
+//! answer: an `ERROR` frame whose code says what went wrong.
+//!
+//! Run with: cargo test -p atomic-server --test it ws_auth_gate
+
+use atomic_lib::{
+    agents::Agent,
+    client::{
+        connected::Client,
+        ws::{WsClient, WsMessage},
+    },
+    sync::protocol,
+};
+use std::time::Duration;
+use tokio::sync::broadcast::Receiver;
+
+use crate::common::{start_server, wait_for_server};
+
+/// Wait for the next `ERROR` the server sends on this connection.
+async fn next_error(rx: &mut Receiver<WsMessage>) -> String {
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            match rx.recv().await {
+                Ok(WsMessage::Error { message, .. }) => return message,
+                Ok(_) => continue,
+                Err(e) => panic!("connection closed before an ERROR arrived: {e}"),
+            }
+        }
+    })
+    .await
+    .expect("server answers a refused frame with an ERROR within 5s")
+}
+
+/// Assert that no `SYNC_OK` (and no ERROR either) shows up for a while.
+async fn assert_quiet(rx: &mut Receiver<WsMessage>) {
+    let unexpected = tokio::time::timeout(Duration::from_millis(700), async {
+        loop {
+            match rx.recv().await {
+                Ok(WsMessage::SyncOk { .. }) => return "SYNC_OK",
+                Ok(WsMessage::Error { .. }) => return "ERROR",
+                Ok(_) => continue,
+                Err(_) => return "closed",
+            }
+        }
+    })
+    .await;
+    assert!(
+        unexpected.is_err(),
+        "expected silence, got {}",
+        unexpected.unwrap()
+    );
+}
+
+/// A SYNC_PUSH frame for `drive` carrying one entry with `bytes`. The
+/// content is irrelevant to a rights refusal: the gate fires before any
+/// entry is looked at.
+fn sync_push(drive: &str, subject: &str, bytes: &[u8]) -> Vec<u8> {
+    protocol::encode_sync_push(drive, &[(subject, bytes)], true)
+}
+
+/// A private drive owned by `owner`, plus one child in it that a stranger
+/// cannot read.
+async fn private_drive_with_child(client: &Client, owner: &Agent) -> (String, String) {
+    let drive = client.new_drive(owner, "Private").await.unwrap();
+    let mut child = client.new_resource(&drive).unwrap();
+    child.set_name("Secret").unwrap();
+    child
+        .set_unsafe(
+            atomic_lib::urls::SHORTNAME.into(),
+            atomic_lib::Value::Slug("secret".into()),
+        )
+        .unwrap();
+    child
+        .set_unsafe(
+            atomic_lib::urls::DESCRIPTION.into(),
+            atomic_lib::Value::String("only the owner can read this".into()),
+        )
+        .unwrap();
+    child
+        .set_unsafe(
+            atomic_lib::urls::IS_A.into(),
+            atomic_lib::Value::ResourceArray(vec![atomic_lib::urls::CLASS.into()]),
+        )
+        .unwrap();
+    let subject = child.save_remote(client.store()).await.unwrap();
+    (drive, subject)
+}
+
+/// Frames that write, or that carry an identity to peers, are refused
+/// before AUTH with `AUTH_REQUIRED`. The socket stays open: an anonymous
+/// session of a public share link keeps reading.
+#[tokio::test]
+async fn anonymous_writes_and_identity_subscriptions_are_refused() {
+    let port = start_server("ws_gate_anon");
+    wait_for_server(port).await;
+    let server_url = format!("http://localhost:{port}");
+    let ws_url = format!("ws://localhost:{port}/ws");
+
+    let client = Client::new(&server_url).await.unwrap();
+    let alice = client.new_agent("Alice").await.unwrap();
+    let drive = client.new_public_drive(&alice, "Public").await.unwrap();
+
+    let ws = WsClient::connect(&ws_url).await.unwrap();
+    let mut rx = ws.subscribe();
+
+    // Binary SYNC_PUSH: the one that used to bootstrap a stranger's drive
+    // onto an open node without anyone saying who they were.
+    ws.send_binary(sync_push(&drive, "did:ad:x", b"junk"))
+        .await
+        .unwrap();
+    let err = next_error(&mut rx).await;
+    assert!(err.contains("AUTH required"), "{err}");
+
+    // The text frames that register an identity-bearing subscription.
+    for frame in [
+        format!(r#"LORO_SYNC_SUBSCRIBE {{"subject":"{drive}"}}"#),
+        format!(r#"PRESENCE_SUBSCRIBE {{"subject":"{drive}"}}"#),
+    ] {
+        ws.send_raw(&frame).await.unwrap();
+        let err = next_error(&mut rx).await;
+        assert!(err.contains("AUTH required"), "{frame} -> {err}");
+    }
+
+    // And the binary EPHEMERAL frame, whatever its kind: an anonymous
+    // socket may not put cursors or text in front of anyone.
+    for kind in [
+        protocol::ephemeral_kind::DOC,
+        protocol::ephemeral_kind::LORO,
+        protocol::ephemeral_kind::PRESENCE,
+    ] {
+        ws.send_binary(protocol::encode_ephemeral(kind, &drive, "", b"x"))
+            .await
+            .unwrap();
+        let err = next_error(&mut rx).await;
+        assert!(
+            err.contains("AUTH required"),
+            "EPHEMERAL kind {kind} -> {err}"
+        );
+    }
+
+    // And the socket is still usable: AUTH now succeeds on the same
+    // connection, so the refusals were per frame, not per connection.
+    ws.authenticate(&alice)
+        .await
+        .expect("the connection survives its refused frames");
+}
+
+/// Anonymous *reads* are not gated by AUTH — `SUB <drive>` is what a
+/// public share link uses for live updates. The read gate is `check_read`,
+/// which an anonymous session passes for a public drive.
+#[tokio::test]
+async fn anonymous_drive_subscription_on_a_public_drive_is_accepted() {
+    let port = start_server("ws_gate_anon_sub");
+    wait_for_server(port).await;
+    let server_url = format!("http://localhost:{port}");
+    let ws_url = format!("ws://localhost:{port}/ws");
+
+    let client = Client::new(&server_url).await.unwrap();
+    let alice = client.new_agent("Alice").await.unwrap();
+    let drive = client.new_public_drive(&alice, "Public").await.unwrap();
+
+    let ws = WsClient::connect(&ws_url).await.unwrap();
+    let mut rx = ws.subscribe();
+    ws.send_binary(protocol::encode_sub(&drive)).await.unwrap();
+    assert_quiet(&mut rx).await;
+}
+
+/// An authenticated agent without read rights on the subject is told so
+/// (`UNAUTHORIZED_READ`) instead of being left to wait for updates that
+/// never come.
+#[tokio::test]
+async fn subscription_without_read_right_is_refused_out_loud() {
+    let port = start_server("ws_gate_read");
+    wait_for_server(port).await;
+    let server_url = format!("http://localhost:{port}");
+    let ws_url = format!("ws://localhost:{port}/ws");
+
+    let client = Client::new(&server_url).await.unwrap();
+    let alice = client.new_agent("Alice").await.unwrap();
+    let (drive, secret) = private_drive_with_child(&client, &alice).await;
+    let mallory = client.new_agent("Mallory").await.unwrap();
+
+    let ws = WsClient::connect(&ws_url).await.unwrap();
+    ws.authenticate(&mallory).await.unwrap();
+    let mut rx = ws.subscribe();
+
+    ws.subscribe_resource(&secret).await.unwrap();
+    let err = next_error(&mut rx).await;
+    assert!(
+        err.contains("SUB refused") && err.contains(&secret),
+        "{err}"
+    );
+
+    ws.send_binary(protocol::encode_sub(&drive)).await.unwrap();
+    let err = next_error(&mut rx).await;
+    assert!(err.contains("SUB refused") && err.contains(&drive), "{err}");
+
+    ws.subscribe_loro_sync(&secret).await.unwrap();
+    let err = next_error(&mut rx).await;
+    assert!(err.contains("LORO_SYNC_SUBSCRIBE refused"), "{err}");
+
+    ws.send_raw(&format!(r#"PRESENCE_SUBSCRIBE {{"subject":"{drive}"}}"#))
+        .await
+        .unwrap();
+    let err = next_error(&mut rx).await;
+    assert!(err.contains("PRESENCE_SUBSCRIBE refused"), "{err}");
+
+    // The owner's subscriptions to the same things go through silently.
+    let ws_owner = WsClient::connect(&ws_url).await.unwrap();
+    ws_owner.authenticate(&alice).await.unwrap();
+    let mut rx_owner = ws_owner.subscribe();
+    ws_owner.subscribe_resource(&secret).await.unwrap();
+    ws_owner
+        .send_binary(protocol::encode_sub(&drive))
+        .await
+        .unwrap();
+    assert_quiet(&mut rx_owner).await;
+}
+
+/// A SYNC_PUSH into a drive the agent may not write is answered with
+/// `SYNC_REJECTED` — and, the point of the change, *not* with `SYNC_OK`.
+#[tokio::test]
+async fn rejected_sync_push_gets_error_not_sync_ok() {
+    let port = start_server("ws_gate_push");
+    wait_for_server(port).await;
+    let server_url = format!("http://localhost:{port}");
+    let ws_url = format!("ws://localhost:{port}/ws");
+
+    let client = Client::new(&server_url).await.unwrap();
+    let alice = client.new_agent("Alice").await.unwrap();
+    let (drive, secret) = private_drive_with_child(&client, &alice).await;
+    let mallory = client.new_agent("Mallory").await.unwrap();
+
+    let ws = WsClient::connect(&ws_url).await.unwrap();
+    ws.authenticate(&mallory).await.unwrap();
+    let mut rx = ws.subscribe();
+
+    ws.send_binary(sync_push(&drive, &secret, b"junk"))
+        .await
+        .unwrap();
+
+    let answer = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            match rx.recv().await {
+                Ok(WsMessage::Error { message, .. }) => return Ok(message),
+                Ok(WsMessage::SyncOk { drive }) => return Err(drive),
+                Ok(_) => continue,
+                Err(e) => panic!("connection closed: {e}"),
+            }
+        }
+    })
+    .await
+    .expect("the push is answered within 5s");
+    let err = answer.expect("a refused push is answered with ERROR, not SYNC_OK");
+    assert!(
+        err.contains("SYNC_PUSH rejected") && err.contains(&drive),
+        "{err}"
+    );
+    assert!(err.contains("no write right"), "{err}");
+    assert_quiet(&mut rx).await;
+}
+
+/// The hash-first probe and the `RBSR_ITEMS` inventory are reads, so they stay
+/// open to anonymous sessions — but gated by `check_read` like every other
+/// read. They used to walk the drive as Sudo, which let anyone enumerate
+/// every subject and version vector of a private drive by naming it.
+#[tokio::test]
+async fn inventory_and_probe_are_gated_by_check_read() {
+    let port = start_server("ws_gate_inventory");
+    wait_for_server(port).await;
+    let server_url = format!("http://localhost:{port}");
+    let ws_url = format!("ws://localhost:{port}/ws");
+
+    let client = Client::new(&server_url).await.unwrap();
+    let alice = client.new_agent("Alice").await.unwrap();
+    let (drive, secret) = private_drive_with_child(&client, &alice).await;
+
+    let ws = WsClient::connect(&ws_url).await.unwrap();
+    let mut rx = ws.subscribe();
+
+    ws.send_raw(&format!(
+        r#"RBSR_ITEMS {{"drive":"{drive}","lo":"","hi":null}}"#
+    ))
+    .await
+    .unwrap();
+    let err = next_error(&mut rx).await;
+    assert!(
+        err.contains("RBSR_ITEMS refused") && err.contains(&drive),
+        "{err}"
+    );
+    assert!(!err.contains(&secret), "the refusal must not leak subjects");
+
+    ws.send_raw(&format!(
+        r#"RBSR_FP {{"drive":"{drive}","ranges":[["",null]]}}"#
+    ))
+    .await
+    .unwrap();
+    // RBSR was removed: an old client's fingerprint query gets an immediate
+    // answer without fingerprints (so it falls back to a full `SYNC`), and
+    // nothing about the drive is read to produce it.
+    let reply = next_text(&mut rx).await;
+    assert!(
+        reply.starts_with("RBSR_FP ") && reply.contains("\"unsupported\":true"),
+        "{reply}"
+    );
+    assert!(
+        !reply.contains("fps") && !reply.contains(&secret),
+        "{reply}"
+    );
+
+    ws.send_binary(protocol::encode_sync_probe(&drive, "deadbeef"))
+        .await
+        .unwrap();
+    let err = next_error(&mut rx).await;
+    assert!(err.contains("SYNC refused"), "{err}");
+
+    // The owner gets the items: the answer names the private child.
+    let ws_owner = WsClient::connect(&ws_url).await.unwrap();
+    ws_owner.authenticate(&alice).await.unwrap();
+    let mut rx_owner = ws_owner.subscribe();
+    ws_owner
+        .send_raw(&format!(
+            r#"RBSR_ITEMS {{"drive":"{drive}","lo":"","hi":null}}"#
+        ))
+        .await
+        .unwrap();
+    let reply = next_text(&mut rx_owner).await;
+    assert!(
+        reply.starts_with("RBSR_ITEMS") && reply.contains(&secret),
+        "{reply}"
+    );
+}
+
+/// The next text frame (the Rust client parses none, so it surfaces as
+/// `Unrecognized`); panics on an `ERROR` or after 5s.
+async fn next_text(rx: &mut Receiver<WsMessage>) -> String {
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            match rx.recv().await {
+                Ok(WsMessage::Unrecognized(text)) => return text,
+                Ok(WsMessage::Error { message, .. }) => panic!("refused: {message}"),
+                Ok(_) => continue,
+                Err(e) => panic!("connection closed: {e}"),
+            }
+        }
+    })
+    .await
+    .expect("a text frame within 5s")
+}
+
+/// An AUTH proof is bound to this server's origin: one signed for another
+/// server (or lifted from an HTTP auth header for some resource URL) does
+/// not open a session here.
+#[tokio::test]
+async fn auth_signed_for_another_origin_is_refused() {
+    let port = start_server("ws_gate_auth_origin");
+    wait_for_server(port).await;
+    let server_url = format!("http://localhost:{port}");
+    let ws_url = format!("ws://localhost:{port}/ws");
+
+    let client = Client::new(&server_url).await.unwrap();
+    let alice = client.new_agent("Alice").await.unwrap();
+
+    let ws = WsClient::connect(&ws_url).await.unwrap();
+    let foreign = protocol::encode_auth(&alice, "https://evil.example").unwrap();
+    let err = ws
+        .authenticate_with_frame(foreign)
+        .await
+        .expect_err("a proof for another origin is refused");
+    assert!(
+        err.to_string().contains("does not name this server"),
+        "{err}"
+    );
+
+    // The agent's own subject is not the server either (the pre-2026-09
+    // Rust client signed that).
+    let own_subject = protocol::encode_auth(&alice, &alice.subject.to_string()).unwrap();
+    assert!(ws.authenticate_with_frame(own_subject).await.is_err());
+
+    // A proof for this origin, signed now, is accepted on the same socket.
+    ws.authenticate(&alice)
+        .await
+        .expect("a fresh proof for this origin authenticates");
+}
+
+/// A server is often reachable under a name other than its configured URL
+/// (a proxy, a container network, this test dialling `127.0.0.1` while the
+/// server calls itself `localhost`). The browser signs the origin it used,
+/// so a proof for the *request's* host is accepted too, as the HTTP auth
+/// headers have always done.
+#[tokio::test]
+async fn auth_signed_for_the_request_host_is_accepted() {
+    let port = start_server("ws_gate_auth_request_host");
+    wait_for_server(port).await;
+    let server_url = format!("http://localhost:{port}");
+
+    let client = Client::new(&server_url).await.unwrap();
+    let alice = client.new_agent("Alice").await.unwrap();
+
+    // `WsClient` signs the origin of the URL it dialled: `http://127.0.0.1:{port}`,
+    // which is not the configured `http://localhost:{port}`.
+    let ws = WsClient::connect(&format!("ws://127.0.0.1:{port}/ws"))
+        .await
+        .unwrap();
+    assert_eq!(ws.origin(), format!("http://127.0.0.1:{port}"));
+    ws.authenticate(&alice)
+        .await
+        .expect("a proof for the host the socket was opened on authenticates");
+
+    // A third name, neither the request host nor the configured URL, still fails.
+    let ws2 = WsClient::connect(&format!("ws://127.0.0.1:{port}/ws"))
+        .await
+        .unwrap();
+    let foreign = protocol::encode_auth(&alice, &format!("http://atomic.example:{port}")).unwrap();
+    assert!(ws2.authenticate_with_frame(foreign).await.is_err());
+}
+
+/// An AUTH proof expires. A captured frame replayed later is refused
+/// instead of staying a permanent key.
+#[tokio::test]
+async fn stale_auth_is_refused() {
+    let port = start_server("ws_gate_auth_stale");
+    wait_for_server(port).await;
+    let server_url = format!("http://localhost:{port}");
+    let ws_url = format!("ws://localhost:{port}/ws");
+
+    let client = Client::new(&server_url).await.unwrap();
+    let alice = client.new_agent("Alice").await.unwrap();
+
+    // The same frame `encode_auth` builds, with a timestamp from well past
+    // the accepted window.
+    let stale_at = atomic_lib::utils::now() - atomic_lib::authentication::AUTH_MAX_AGE_MS - 60_000;
+    let message = format!("{server_url} {stale_at}");
+    let signature =
+        atomic_lib::agents::sign_message(message.as_bytes(), alice.private_key.as_ref().unwrap())
+            .unwrap();
+    let stale = serde_json::json!({
+        "https://atomicdata.dev/properties/auth/publicKey": alice.public_key,
+        "https://atomicdata.dev/properties/auth/timestamp": stale_at,
+        "https://atomicdata.dev/properties/auth/signature": signature,
+        "https://atomicdata.dev/properties/auth/requestedSubject": server_url,
+        "https://atomicdata.dev/properties/auth/agent": alice.subject.to_string(),
+    });
+    let mut frame = vec![protocol::tag::AUTH];
+    frame.extend_from_slice(stale.to_string().as_bytes());
+
+    let ws = WsClient::connect(&ws_url).await.unwrap();
+    let err = ws
+        .authenticate_with_frame(frame)
+        .await
+        .expect_err("a stale proof is refused");
+    assert!(err.to_string().contains("too old"), "{err}");
+}
+
+/// The server's first frame is a `CHALLENGE`. A proof that answers it is
+/// good on that socket only: captured and replayed on another connection it
+/// is refused, even though its timestamp is fresh. A proof without a nonce
+/// (a client that predates the frame) is still accepted.
+#[tokio::test]
+async fn auth_nonce_binds_the_proof_to_its_connection() {
+    let port = start_server("ws_gate_auth_nonce");
+    wait_for_server(port).await;
+    let server_url = format!("http://localhost:{port}");
+    let ws_url = format!("ws://localhost:{port}/ws");
+
+    let client = Client::new(&server_url).await.unwrap();
+    let alice = client.new_agent("Alice").await.unwrap();
+
+    let a = WsClient::connect(&ws_url).await.unwrap();
+    let b = WsClient::connect(&ws_url).await.unwrap();
+
+    let subject_a = a.auth_subject().await;
+    let subject_b = b.auth_subject().await;
+    let (origin_a, nonce_a) = subject_a
+        .split_once('#')
+        .expect("the client signs `{origin}#{nonce}` once the CHALLENGE arrived");
+    assert_eq!(origin_a, server_url);
+    assert_eq!(nonce_a.len(), 64, "32 random bytes, hex");
+    assert_ne!(subject_a, subject_b, "every connection gets its own nonce");
+
+    // A's proof replayed on B: refused, and B stays anonymous.
+    let proof_for_a = protocol::encode_auth(&alice, &subject_a).unwrap();
+    let err = b
+        .authenticate_with_frame(proof_for_a.clone())
+        .await
+        .expect_err("a proof answering another connection's challenge is refused");
+    assert!(
+        err.to_string()
+            .contains("does not answer this connection's CHALLENGE"),
+        "{err}"
+    );
+
+    // The same proof where it belongs: accepted.
+    a.authenticate_with_frame(proof_for_a)
+        .await
+        .expect("the proof authenticates on the connection whose challenge it answers");
+
+    // A nonce-less proof for the origin (pre-2026-09 client) still works.
+    let legacy = protocol::encode_auth(&alice, &server_url).unwrap();
+    b.authenticate_with_frame(legacy)
+        .await
+        .expect("a timestamp-bounded proof without a nonce is still accepted");
+
+    // `authenticate` does all of this by itself.
+    let c = WsClient::connect(&ws_url).await.unwrap();
+    c.authenticate(&alice)
+        .await
+        .expect("authenticate answers the challenge");
+}
+
+/// A subscription is admitted under the identity the connection had at the
+/// time. When a later `AUTH` changes that identity, the server re-checks
+/// every subscription the connection holds against the new agent and drops
+/// the ones it cannot read; until 2026-09 a drive `SUB` accepted as the
+/// owner kept delivering after the socket re-authenticated as a stranger.
+#[tokio::test]
+async fn subscriptions_are_rebound_when_auth_changes_identity() {
+    let port = start_server("ws_gate_rebind");
+    wait_for_server(port).await;
+    let server_url = format!("http://localhost:{port}");
+    let ws_url = format!("ws://localhost:{port}/ws");
+
+    let client = Client::new(&server_url).await.unwrap();
+    // Mallory first: `new_agent` makes the newest agent the client's signing
+    // agent, and the HTTP edits below must be Alice's.
+    let mallory = client.new_agent("Mallory").await.unwrap();
+    let alice = client.new_agent("Alice").await.unwrap();
+    let (drive, secret) = private_drive_with_child(&client, &alice).await;
+
+    // Alice subscribes to her private drive and to the secret itself.
+    let ws = WsClient::connect(&ws_url).await.unwrap();
+    ws.authenticate(&alice).await.unwrap();
+    let mut rx = ws.subscribe();
+    ws.send_binary(protocol::encode_sub(&drive)).await.unwrap();
+    ws.subscribe_resource(&secret).await.unwrap();
+    assert_quiet(&mut rx).await;
+
+    let edit = |name: &'static str| {
+        let client = &client;
+        let secret = secret.clone();
+        async move {
+            let mut resource = client.get_resource(&secret).await.unwrap();
+            resource.set_name(name).unwrap();
+            resource.save_remote(client.store()).await.unwrap();
+        }
+    };
+    // Control: as Alice, the edit arrives.
+    edit("v2").await;
+    assert!(
+        update_within(&mut rx, &secret, 1500).await,
+        "the owner receives her own drive's updates"
+    );
+
+    // The same socket re-authenticates as Mallory, who may not read the drive.
+    ws.authenticate(&mallory).await.unwrap();
+    // Give the monitor a moment to process the rebind.
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    while rx.try_recv().is_ok() {}
+
+    edit("v3").await;
+    assert!(
+        !update_within(&mut rx, &secret, 1500).await,
+        "a subscription admitted as Alice must not deliver once the socket is Mallory's"
+    );
+
+    // Back to Alice: her fresh SUB is admitted again, and delivers.
+    ws.authenticate(&alice).await.unwrap();
+    ws.send_binary(protocol::encode_sub(&drive)).await.unwrap();
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    while rx.try_recv().is_ok() {}
+    edit("v4").await;
+    assert!(
+        update_within(&mut rx, &secret, 1500).await,
+        "re-subscribing as the owner delivers again"
+    );
+}
+
+/// Whether an `UPDATE` for `subject` arrives within `ms` milliseconds.
+async fn update_within(rx: &mut Receiver<WsMessage>, subject: &str, ms: u64) -> bool {
+    tokio::time::timeout(Duration::from_millis(ms), async {
+        loop {
+            match rx.recv().await {
+                Ok(WsMessage::Update { subject: s, .. }) if s == subject => return true,
+                Ok(_) => continue,
+                Err(_) => return false,
+            }
+        }
+    })
+    .await
+    .unwrap_or(false)
+}
+
+/// The hash-first probe is binary: a `SYNC` whose payload says `probe` is
+/// answered with `SYNC_OK` when the drive hashes match and `SYNC_RESEND`
+/// when they do not, both binary.
+#[tokio::test]
+async fn sync_probe_miss_is_answered_with_sync_resend() {
+    let port = start_server("ws_gate_sync_probe");
+    wait_for_server(port).await;
+    let server_url = format!("http://localhost:{port}");
+    let ws_url = format!("ws://localhost:{port}/ws");
+
+    let client = Client::new(&server_url).await.unwrap();
+    let alice = client.new_agent("Alice").await.unwrap();
+    let drive = client.new_public_drive(&alice, "Probed").await.unwrap();
+
+    let ws = WsClient::connect(&ws_url).await.unwrap();
+    let mut rx = ws.subscribe();
+    ws.send_binary(protocol::encode_sync_probe(&drive, "not-the-hash"))
+        .await
+        .unwrap();
+    let answer = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            match rx.recv().await {
+                Ok(WsMessage::SyncResend { drive: d }) => return Ok(d),
+                Ok(WsMessage::SyncOk { drive: d }) => return Err(format!("SYNC_OK for {d}")),
+                Ok(WsMessage::Error { message, .. }) => return Err(message),
+                Ok(_) => continue,
+                Err(e) => panic!("connection closed: {e}"),
+            }
+        }
+    })
+    .await
+    .expect("the probe is answered within 5s");
+    assert_eq!(answer, Ok(drive));
+}
+
+/// A browser cannot see protocol-level pings, so it probes with `KEEPALIVE`
+/// and the server echoes it. Anonymous is fine: it carries nothing.
+#[tokio::test]
+async fn keepalive_is_echoed() {
+    let port = start_server("ws_gate_keepalive");
+    wait_for_server(port).await;
+    let ws_url = format!("ws://localhost:{port}/ws");
+
+    let ws = WsClient::connect(&ws_url).await.unwrap();
+    let mut rx = ws.subscribe();
+    ws.send_keepalive().await.unwrap();
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            match rx.recv().await {
+                Ok(WsMessage::Keepalive) => return,
+                Ok(_) => continue,
+                Err(e) => panic!("connection closed: {e}"),
+            }
+        }
+    })
+    .await
+    .expect("the server echoes KEEPALIVE within 5s");
+}
+
+/// A raw WebSocket, for tests that must see every frame. `WsClient` turns a
+/// `DEPRECATED_CLIENT` notice into a log line, so it cannot show one.
+mod raw {
+    use super::*;
+    use futures_util::{SinkExt, StreamExt};
+    use tokio_tungstenite::tungstenite::Message;
+
+    pub type Socket = tokio_tungstenite::WebSocketStream<
+        tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
+    >;
+
+    pub async fn connect(port: u16) -> Socket {
+        tokio_tungstenite::connect_async(format!("ws://localhost:{port}/ws"))
+            .await
+            .expect("websocket connects")
+            .0
+    }
+
+    pub async fn send(ws: &mut Socket, frame: Vec<u8>) {
+        ws.send(Message::Binary(frame.into())).await.unwrap();
+    }
+
+    /// Read binary frames for up to `ms`, returning the `ERROR` codes seen
+    /// with `request_id` 0 and whether a `KEEPALIVE` echo arrived.
+    pub async fn drain(ws: &mut Socket, ms: u64) -> (Vec<u16>, bool) {
+        let mut codes = Vec::new();
+        let mut keepalive = false;
+        let _ = tokio::time::timeout(Duration::from_millis(ms), async {
+            while let Some(Ok(msg)) = ws.next().await {
+                let Message::Binary(bin) = msg else { continue };
+                match bin.first() {
+                    Some(&protocol::tag::ERROR) => {
+                        if let Some(e) = protocol::decode_error(&bin[1..]) {
+                            if e.request_id == 0 {
+                                codes.push(e.code);
+                            }
+                        }
+                    }
+                    Some(&protocol::tag::KEEPALIVE) => keepalive = true,
+                    _ => {}
+                }
+            }
+        })
+        .await;
+        (codes, keepalive)
+    }
+}
+
+/// A client whose `HELLO` lacks `canonical-scheme` predates v0.41.0-beta.8:
+/// it gets one `DEPRECATED_CLIENT` notice, and the connection keeps working.
+#[tokio::test]
+async fn hello_without_canonical_scheme_gets_deprecation_notice() {
+    let port = start_server("ws_gate_deprecated_hello");
+    wait_for_server(port).await;
+
+    let mut ws = raw::connect(port).await;
+    raw::send(
+        &mut ws,
+        protocol::encode_hello_with_caps("old client", &["commit-ok-slim"]),
+    )
+    .await;
+    raw::send(&mut ws, protocol::encode_keepalive()).await;
+    let (codes, keepalive) = raw::drain(&mut ws, 1500).await;
+    assert_eq!(codes, vec![protocol::error_code::DEPRECATED_CLIENT]);
+    assert!(keepalive, "the connection still answers after the notice");
+}
+
+/// A current client (the caps this build sends) is not told anything.
+#[tokio::test]
+async fn current_client_gets_no_deprecation_notice() {
+    let port = start_server("ws_gate_current_client");
+    wait_for_server(port).await;
+
+    let mut ws = raw::connect(port).await;
+    raw::send(
+        &mut ws,
+        protocol::encode_hello_with_caps("current", protocol::CLIENT_CAPABILITIES),
+    )
+    .await;
+    raw::send(&mut ws, protocol::encode_keepalive()).await;
+    let (codes, keepalive) = raw::drain(&mut ws, 1500).await;
+    assert!(codes.is_empty(), "no notice expected, got {codes:?}");
+    assert!(keepalive);
+}

@@ -1,0 +1,381 @@
+use crate::{
+    appstate::AppState, context::RequestContext, errors::AtomicServerResult,
+    helpers::get_client_agent,
+};
+use actix_web::http::header::{ContentDisposition, DispositionType};
+use actix_web::{web, HttpRequest, HttpResponse};
+use atomic_lib::storelike::Query;
+use atomic_lib::{urls, Resource, Storelike, Subject, Value};
+
+use serde::Deserialize;
+#[cfg(feature = "img")]
+use std::collections::HashSet;
+
+#[serde_with::serde_as]
+#[serde_with::skip_serializing_none]
+#[derive(Deserialize, Debug)]
+pub struct DownloadParams {
+    pub q: Option<f32>,
+    pub w: Option<u32>,
+    pub f: Option<String>,
+}
+
+const DEFAULT_MIMETYPE: &str = "application/octet-stream";
+
+/// Downloads the File of the Resource that matches the same URL minus the `/download` path.
+#[tracing::instrument(skip(appstate, req))]
+pub async fn handle_download(
+    path: Option<web::Path<String>>,
+    appstate: web::Data<AppState>,
+    params: web::Query<DownloadParams>,
+    req: actix_web::HttpRequest,
+) -> AtomicServerResult<HttpResponse> {
+    let headers = req.headers();
+    let origin = RequestContext::new(&req, &appstate).origin;
+    let store = &appstate.store;
+
+    let subject_path = if let Some(pth) = path {
+        format!("/{}", pth)
+    } else {
+        // There is no end string, so It's the root of the URL, the base URL!
+        return Err("Put `/download` in front of an File URL to download it.".into());
+    };
+
+    // Content-addressed URLs identify blob bytes, not a File resource at
+    // `/files/<hash>`. This remains true when requesting an image rendition:
+    // uploads have DID resources, and peers can hold the blob without metadata.
+    // The mimetype is not carried by the hash alone, so it is recovered from
+    // any File resource sharing this `internalId` — falling back to
+    // `application/octet-stream` only when none exists (see
+    // `mimetype_by_internal_id`; without the real mimetype, `nosniff` makes
+    // browsers refuse to render an uploaded SVG inline).
+    if let Some(hash_hex) = subject_path.strip_prefix("/files/") {
+        if hash_hex.len() == 64 && hex::decode(hash_hex).is_ok() {
+            let (bytes, mimetype) = match blob_by_hash_hex(hash_hex, &appstate).await? {
+                Some(bytes) => (
+                    Some(bytes),
+                    mimetype_by_internal_id(hash_hex, &appstate).await,
+                ),
+                None => match chunked_file_by_internal_id(hash_hex, &appstate).await? {
+                    Some(file) => (
+                        Some(reconstruct_file_bytes(&file, &appstate).await?),
+                        mimetype_of(&file),
+                    ),
+                    None => (None, DEFAULT_MIMETYPE.to_string()),
+                },
+            };
+            let bytes = bytes.ok_or_else(|| {
+                atomic_lib::errors::AtomicError::not_found(format!("Blob not found: {hash_hex}"))
+            })?;
+            if params.q.is_none() && params.w.is_none() && params.f.is_none() {
+                return Ok(user_blob_response(mimetype, bytes));
+            }
+            let hash_bytes = hex::decode(hash_hex).expect("validated hash");
+            return serve_processed_image(&bytes, &hash_bytes, &params, &appstate).await;
+        }
+    }
+
+    let subject = atomic_lib::Subject::from_raw(&subject_path, None);
+
+    // Support did:ad:blob: subjects directly in /download
+    if subject.is_blob_did() {
+        if let Some(hash_hex) = subject.blob_hash_hex() {
+            if let Some(bytes) = blob_by_hash_hex(hash_hex, &appstate).await? {
+                let mimetype = mimetype_by_internal_id(hash_hex, &appstate).await;
+
+                return Ok(user_blob_response(mimetype, bytes));
+            }
+        }
+    }
+
+    let resolved_subject = subject.resolve(&origin);
+
+    let for_agent = get_client_agent(headers, &appstate, &resolved_subject).await?;
+    tracing::info!("handle_download: {}", resolved_subject);
+
+    let resource = store
+        .get_resource_extended(&resolved_subject.into(), false, &for_agent)
+        .await?
+        .to_single();
+
+    download_file_handler_partial(&resource, &req, &params, &appstate).await
+}
+
+/// Serves user-uploaded blob bytes as a forced download rather than rendering
+/// inline. The stored `mimetype` is attacker-controlled at upload time (e.g.
+/// `text/html`, `image/svg+xml`); with no Content-Disposition/nosniff, a
+/// browser opening the download link would render an uploaded script
+/// same-origin, reading the session cookie and the Agent's private key out of
+/// IndexedDB. Forcing `attachment` + `nosniff` closes that off; it doesn't
+/// affect legitimate inline use (e.g. `<img>` embedding), since
+/// Content-Disposition only governs top-level navigation, not embedded
+/// resource fetches.
+fn user_blob_response(content_type: impl AsRef<str>, bytes: Vec<u8>) -> HttpResponse {
+    HttpResponse::Ok()
+        .content_type(content_type.as_ref())
+        .insert_header((
+            actix_web::http::header::CONTENT_DISPOSITION,
+            ContentDisposition {
+                disposition: DispositionType::Attachment,
+                parameters: vec![],
+            },
+        ))
+        .insert_header((
+            actix_web::http::header::HeaderName::from_static("x-content-type-options"),
+            actix_web::http::header::HeaderValue::from_static("nosniff"),
+        ))
+        .body(bytes)
+}
+
+/// Look up a blob by its hex-encoded BLAKE3 hash. Returns `None` if the input
+/// is not a 64-char hex string or no blob is stored under that hash.
+async fn blob_by_hash_hex(
+    hash_hex: &str,
+    appstate: &AppState,
+) -> AtomicServerResult<Option<Vec<u8>>> {
+    if hash_hex.len() != 64 {
+        return Ok(None);
+    }
+    let Ok(hash_bytes) = hex::decode(hash_hex) else {
+        return Ok(None);
+    };
+    Ok(appstate.store.get_blob(&hash_bytes).await?)
+}
+
+/// The bytes of a File: concatenated chunk blobs when it is chunked (its `chunks`
+/// property is a non-empty ordered list of `did:ad:blob:` refs), otherwise the
+/// single blob referenced by `internalId`.
+async fn reconstruct_file_bytes(
+    resource: &Resource,
+    appstate: &AppState,
+) -> AtomicServerResult<Vec<u8>> {
+    if let Ok(Value::ResourceArray(chunks)) = resource.get(urls::CHUNKS) {
+        if !chunks.is_empty() {
+            let mut out = Vec::new();
+
+            for chunk in chunks {
+                let did = chunk.to_string();
+                let subject = Subject::from(did.as_str());
+                let hash_hex = subject
+                    .blob_hash_hex()
+                    .ok_or_else(|| format!("Invalid chunk reference: {did}"))?;
+                let bytes = blob_by_hash_hex(hash_hex, appstate)
+                    .await?
+                    .ok_or_else(|| format!("Chunk blob not found: {hash_hex}"))?;
+                out.extend_from_slice(&bytes);
+            }
+
+            return Ok(out);
+        }
+    }
+
+    let internal_id = resource
+        .get(urls::INTERNAL_ID)
+        .map_err(|e| format!("Internal ID of file could not be resolved. {}", e))?
+        .to_string();
+    let hash_bytes = hex::decode(&internal_id)
+        .map_err(|_| format!("File internalId is not hex: {}", internal_id))?;
+    if hash_bytes.len() != 32 {
+        return Err(format!(
+            "File internalId is not a 32-byte BLAKE3 hash: {}",
+            internal_id
+        )
+        .into());
+    }
+
+    appstate
+        .store
+        .get_blob(&hash_bytes)
+        .await?
+        .ok_or_else(|| format!("Blob not found: {}", internal_id).into())
+}
+
+/// Every File resource whose whole-file `internalId` is this hash. Lets the
+/// content-addressed `/download/files/{hash}` route recover the metadata
+/// (mimetype, chunk list) that the hash alone does not carry. More than one
+/// File can share a hash — the same bytes uploaded twice are stored once.
+async fn files_by_internal_id(
+    hash_hex: &str,
+    appstate: &AppState,
+) -> AtomicServerResult<Vec<Resource>> {
+    let result = appstate
+        .store
+        .query(&Query::new_prop_val(urls::INTERNAL_ID, hash_hex))
+        .await?;
+
+    Ok(result.resources)
+}
+
+/// Find a chunked File by its whole-file `internalId`, so the content-addressed
+/// URL works for chunked files (whose whole-file blob is never stored).
+/// `None` if no such chunked File.
+async fn chunked_file_by_internal_id(
+    hash_hex: &str,
+    appstate: &AppState,
+) -> AtomicServerResult<Option<Resource>> {
+    Ok(files_by_internal_id(hash_hex, appstate)
+        .await?
+        .into_iter()
+        .find(|r| matches!(r.get(urls::CHUNKS), Ok(Value::ResourceArray(c)) if !c.is_empty())))
+}
+
+/// The File's stored `mimetype`, or `application/octet-stream` when it has none.
+fn mimetype_of(resource: &Resource) -> String {
+    resource
+        .get(urls::MIMETYPE)
+        .map(|v| v.to_string())
+        .unwrap_or_else(|_| DEFAULT_MIMETYPE.to_string())
+}
+
+/// The mimetype of the File whose `internalId` is this hash.
+///
+/// The content-addressed routes are handed nothing but a hash, but they must
+/// still answer with the real mimetype: `user_blob_response` sets `nosniff`, so
+/// an `application/octet-stream` answer makes the browser refuse to render the
+/// bytes in an `<img>` — which is exactly how every client-uploaded file is
+/// referenced, since `downloadURL` points at `/download/files/{hash}`.
+async fn mimetype_by_internal_id(hash_hex: &str, appstate: &AppState) -> String {
+    let Ok(files) = files_by_internal_id(hash_hex, appstate).await else {
+        return DEFAULT_MIMETYPE.to_string();
+    };
+
+    // Duplicate uploads of the same bytes all carry the same mimetype, so any
+    // File that has one answers for the hash; skip those that don't.
+    files
+        .iter()
+        .find_map(|f| f.get(urls::MIMETYPE).ok().map(|v| v.to_string()))
+        .unwrap_or_else(|| DEFAULT_MIMETYPE.to_string())
+}
+
+pub async fn download_file_handler_partial(
+    resource: &Resource,
+    _req: &HttpRequest,
+    params: &web::Query<DownloadParams>,
+    appstate: &AppState,
+) -> AtomicServerResult<HttpResponse> {
+    let bytes = reconstruct_file_bytes(resource, appstate).await?;
+
+    // The source hash for the image-rendition cache key is the whole-file hash.
+    let internal_id = resource
+        .get(urls::INTERNAL_ID)
+        .map(|v| v.to_string())
+        .unwrap_or_default();
+    let hash_bytes = hex::decode(&internal_id).unwrap_or_default();
+
+    let mimetype = mimetype_of(resource);
+
+    // No params: serve the original bytes verbatim.
+    if params.q.is_none() && params.w.is_none() && params.f.is_none() {
+        return Ok(user_blob_response(mimetype, bytes));
+    }
+
+    // With image params: serve a processed rendition. Cache it in the blob backend
+    // under a deterministic synthetic hash so future requests with the same
+    // params hit the cache and any peer that has produced the same rendition
+    // can serve it content-addressably.
+    serve_processed_image(&bytes, &hash_bytes, params, appstate).await
+}
+
+#[cfg(feature = "img")]
+async fn serve_processed_image(
+    source_bytes: &[u8],
+    source_hash: &[u8],
+    params: &web::Query<DownloadParams>,
+    appstate: &AppState,
+) -> AtomicServerResult<HttpResponse> {
+    use crate::handlers::image::{is_image_bytes, process_image_bytes};
+
+    let quantized = quantize_params(params);
+    let params = &quantized;
+    let format = get_format(params)?;
+    let cache_key = processed_cache_key(source_hash, &format, params);
+
+    if let Some(cached) = appstate.store.get_blob(&cache_key).await? {
+        return Ok(user_blob_response(mimetype_for(&format), cached));
+    }
+
+    if !is_image_bytes(source_bytes) {
+        return Err("Quality or width parameters are only supported for image files".into());
+    }
+
+    let encoded = process_image_bytes(source_bytes, params, &format)?;
+    appstate.store.put_blob(&cache_key, &encoded).await?;
+
+    Ok(user_blob_response(mimetype_for(&format), encoded))
+}
+
+#[cfg(not(feature = "img"))]
+async fn serve_processed_image(
+    _source_bytes: &[u8],
+    _source_hash: &[u8],
+    _params: &web::Query<DownloadParams>,
+    _appstate: &AppState,
+) -> AtomicServerResult<HttpResponse> {
+    Err("Image processing is not enabled in this build (compile with the `img` feature)".into())
+}
+
+/// Deterministic 32-byte cache key for a processed rendition. Same source
+/// hash + same params => same key on every server, so the rendition is
+/// content-addressable across the mesh.
+#[cfg(feature = "img")]
+fn processed_cache_key(source_hash: &[u8], format: &str, params: &DownloadParams) -> [u8; 32] {
+    let canonical = format!(
+        "processed|hash={}|f={}|q={}|w={}",
+        hex::encode(source_hash),
+        format,
+        params.q.map(|q| q.to_string()).unwrap_or_default(),
+        params.w.map(|w| w.to_string()).unwrap_or_default(),
+    );
+    *blake3::hash(canonical.as_bytes()).as_bytes()
+}
+
+/// Largest width a rendition is produced at; wider requests are clamped.
+#[cfg(feature = "img")]
+const MAX_RENDITION_WIDTH: u32 = 4096;
+/// Widths are rounded up to a multiple of this, qualities to whole numbers.
+#[cfg(feature = "img")]
+const RENDITION_WIDTH_STEP: u32 = 64;
+
+/// Snap the rendition parameters onto a small grid before they reach either
+/// the encoder or the cache key. Renditions are persisted per distinct
+/// parameter set and nothing evicts them, so with `q` an `f32` and `w` any
+/// number, a reader of one public image could grow the store without bound by
+/// varying them. On the grid there are at most 100 x 64 renditions per format.
+#[cfg(feature = "img")]
+fn quantize_params(params: &DownloadParams) -> DownloadParams {
+    let q = params.q.map(|q| {
+        let q = if q.is_finite() { q } else { 80.0 };
+        q.round().clamp(1.0, 100.0)
+    });
+    let w = params.w.map(|w| {
+        let w = w.clamp(1, MAX_RENDITION_WIDTH);
+        w.div_ceil(RENDITION_WIDTH_STEP) * RENDITION_WIDTH_STEP
+    });
+    DownloadParams {
+        q,
+        w,
+        f: params.f.clone(),
+    }
+}
+
+#[cfg(feature = "img")]
+fn mimetype_for(format: &str) -> &'static str {
+    match format {
+        "webp" => "image/webp",
+        "avif" => "image/avif",
+        _ => "application/octet-stream",
+    }
+}
+
+#[cfg(feature = "img")]
+fn get_format(params: &DownloadParams) -> AtomicServerResult<String> {
+    let supported_compression_formats: HashSet<String> =
+        HashSet::from_iter(vec!["webp".to_string(), "avif".to_string()]);
+
+    let format = params.f.clone().unwrap_or("webp".to_string());
+    if !supported_compression_formats.contains(&format) {
+        return Err("Unsupported format".into());
+    }
+
+    Ok(format)
+}

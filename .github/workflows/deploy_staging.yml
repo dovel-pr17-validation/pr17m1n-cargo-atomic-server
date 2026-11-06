@@ -1,0 +1,64 @@
+name: Deployment Staging
+
+# Staging follows `develop`. Production follows a stable `v*` tag, not a
+# branch. Same rule otherwise: deploy the commit whose pipeline passed, not
+# merely the latest commit. Superseded develop runs must not deploy even if
+# they completed successfully before GitHub processed their cancellation.
+# See deploy_production.yml for why `workflow_run` rather than `push`, and why
+# the head_sha has to be passed explicitly.
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: "Commit or branch to deploy"
+        required: false
+        default: develop
+        type: string
+  # Was on hold from 25 September 2026 to 15 October: the pre-swap
+  # `./atomic-server export` was OOM-killed on the host (exit 137) on four
+  # deploys in a row, and each failure rolled back to an unchecked binary. The
+  # pre-swap backup in `deploy-server` is now a copy of the redb store file,
+  # which needs no extra memory.
+  workflow_run:
+    workflows: ["Main pipeline: build, lint, test"]
+    branches: ["develop"]
+    types: [completed]
+
+jobs:
+  check-current-tip:
+    if: github.event_name == 'workflow_run' && github.event.workflow_run.conclusion == 'success'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    outputs:
+      current: ${{ steps.tip.outputs.current }}
+    steps:
+      - name: Check that the successful run tested the current develop tip
+        id: tip
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          RUN_SHA: ${{ github.event.workflow_run.head_sha }}
+        run: |
+          set -euo pipefail
+          tip=$(gh api "repos/$REPO/branches/develop" --jq .commit.sha)
+          if [ "$RUN_SHA" = "$tip" ]; then
+            echo 'current=true' >> "$GITHUB_OUTPUT"
+          else
+            echo "Skipping staging: successful run $RUN_SHA was superseded by $tip"
+            echo 'current=false' >> "$GITHUB_OUTPUT"
+          fi
+
+  deploy-staging:
+    needs: check-current-tip
+    if: >-
+      always() &&
+      (github.event_name == 'workflow_dispatch' ||
+       (github.event.workflow_run.conclusion == 'success' &&
+        needs.check-current-tip.outputs.current == 'true'))
+    uses: "./.github/workflows/deployment.yml"
+    with:
+      environment: staging
+      remote_host: staging.atomicdata.dev
+      ref: ${{ github.event_name == 'workflow_dispatch' && inputs.ref || github.event.workflow_run.head_sha }}
+    secrets: inherit

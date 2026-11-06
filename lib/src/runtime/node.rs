@@ -1,0 +1,526 @@
+//! [`AtomicNode`]: a thin, named surface over [`Db`].
+//!
+//! The initial facade delegated to existing store operations. It now also
+//! groups local writes with outbox bookkeeping, so an adapter can save and
+//! queue an edit through one method. Ingestion policies centralize the
+//! commit-validation options used by bindings. These are convenience methods
+//! inside the library; `atomic_lib` remains the component boundary.
+//!
+//! Slice 1 (2026-09-01) shipped this with a wider aspirational API — `open`
+//! with a storage config, `get`, `mutate`, `subscribe`, `sync_with_peer`.
+//! Three days later nothing but the WASM binding had bound to it, and the
+//! WASM binding used four methods. The surface was cut down to those on
+//! 2026-09-04; the seam stays, and grows again when a second adapter binds
+//! to it (`planning/atomic-lib-runtime.md`).
+//!
+//! Since that cutback, local saves, local commit application, outbox access
+//! and delivery, and KV full-text search have been added. The WASM binding
+//! holds an `AtomicNode`; Flutter also constructs one around its shared `Db`
+//! for selected calls.
+
+use std::sync::Arc;
+
+use crate::{
+    agents::Agent,
+    commit::{Commit, CommitOpts, CommitResponse},
+    db::{kv_store::KvStore, Db},
+    errors::AtomicResult,
+    storelike::{Query, QueryResult},
+    sync::engine::{ingest_commit, CommitIngestOpts},
+    sync::outbox::{CommitTransport, DrainReport, Outbox},
+    Resource, Storelike,
+};
+
+/// The trust role under which a signed commit is ingested. `Hub` and `Peer`
+/// are [`CommitIngestOpts::hub`] and [`CommitIngestOpts::peer`];
+/// `LocalCache` is the browser's WASM cache applying a commit the server
+/// already accepted.
+///
+/// | policy | signature | rights | timestamp | ownership | loro causality | live echo |
+/// | --- | --- | --- | --- | --- | --- | --- |
+/// | `Hub` | yes | yes | yes | yes | yes | fan out |
+/// | `Peer` | yes | yes | yes | no | no | suppressed |
+/// | `LocalCache` | no | no | no | no | no | fan out |
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub enum IngestPolicy {
+    /// This node owns the subject and is the authority: HTTP `/commit` and
+    /// hub WS `COMMIT`. `source_id` is the connection the commit came from,
+    /// so the commit monitor does not echo it back; `response_origin`
+    /// resolves `internal:/` subjects in the response.
+    Hub {
+        source_id: Option<String>,
+        response_origin: Option<String>,
+    },
+    /// A signed commit from another full node (Iroh / peer `COMMIT` frame).
+    /// Fully validated, but this node may host subjects it does not own and
+    /// concurrent writes are expected.
+    #[default]
+    Peer,
+    /// A trusted local cache (browser WASM/OPFS) mirroring what its hub
+    /// already accepted. Nothing is validated; only the index is updated.
+    LocalCache,
+}
+
+/// A running Atomic node: durable store plus the local agent that signs for
+/// it. Cheap to clone (`Db` is a bundle of `Arc`s); clones share the store,
+/// its event channel and its default agent.
+#[derive(Clone)]
+pub struct AtomicNode {
+    db: Db,
+}
+
+impl AtomicNode {
+    /// Open a node over an application-supplied storage backend.
+    ///
+    /// Runs the same migrations, embedded-model bootstrap, compression wrapper,
+    /// and index initialization as the built-in database constructors. The
+    /// backend must satisfy [`KvStore`]'s ordering and atomic-batch contract and
+    /// provide the required durability policy. Install a signing agent with
+    /// [`Self::set_agent`] before making local writes.
+    ///
+    /// Clones of the returned node share their runtime state. Independently
+    /// opening the same backend does not coordinate concurrent node writers.
+    pub async fn open_with_store(
+        store: Arc<dyn KvStore>,
+        base_domain: Option<String>,
+    ) -> AtomicResult<Self> {
+        Ok(Self::from_db(
+            Db::init_with_store(store, base_domain).await?,
+        ))
+    }
+
+    /// Wrap an already-opened store. Adapters construct `Db` themselves
+    /// (the WASM `ClientDb`, the server's `AppState`) and bind here.
+    pub fn from_db(db: Db) -> Self {
+        Self { db }
+    }
+
+    /// **Internal:** the underlying store, for operations this surface does not name
+    /// (blobs, version vectors, import/export, drive setup, events).
+    pub fn db(&self) -> &Db {
+        &self.db
+    }
+
+    /// The agent that signs local edits (`Storelike::get_default_agent`).
+    pub fn agent(&self) -> Option<Agent> {
+        self.db.get_default_agent().ok()
+    }
+
+    /// Install (or replace) the agent that signs local edits
+    /// (`Storelike::set_default_agent`).
+    pub fn set_agent(&self, agent: Agent) {
+        self.db.set_default_agent(agent);
+    }
+
+    /// Run an indexed query (`Storelike::query`). Rights are checked per hit
+    /// via `Query::for_agent`.
+    pub async fn query(&self, q: &Query) -> AtomicResult<QueryResult> {
+        self.db.query(q).await
+    }
+
+    /// Local KV full-text search (`crate::search::query`).
+    pub fn search(
+        &self,
+        query: &str,
+        opts: &crate::client::search::SearchOpts,
+    ) -> AtomicResult<Vec<crate::search::SearchHit>> {
+        self.db.search_hits(query, opts)
+    }
+
+    /// The durable outbox of the node's signing agent
+    /// (`crate::sync::outbox`): what this node wrote and no hub has
+    /// acknowledged yet.
+    pub fn outbox(&self) -> Outbox {
+        Outbox::new(self.db.clone())
+    }
+
+    /// Save a locally edited resource: sign with the node's agent, apply,
+    /// and queue the subject for the hub (`Resource::save_locally` then
+    /// `Outbox::mark_dirty`). The one write path a binding should use for
+    /// its own edits; a save that skips the queue is an edit that never
+    /// leaves the device.
+    pub async fn save_locally(&self, resource: &mut Resource) -> AtomicResult<CommitResponse> {
+        let response = resource.save_locally(&self.db).await?;
+        self.outbox().mark_dirty(&response).await?;
+        Ok(response)
+    }
+
+    /// Apply a commit this node signed itself (a destroy, an undo built
+    /// from history) and queue it like `save_locally` does.
+    pub async fn apply_local_commit(
+        &self,
+        commit: Commit,
+        opts: &CommitOpts,
+    ) -> AtomicResult<CommitResponse> {
+        let response = self.db.apply_commit(commit, opts).await?;
+        self.outbox().mark_dirty(&response).await?;
+        Ok(response)
+    }
+
+    /// Deliver queued writes over `transport` (`Outbox::drain_all`): the node's
+    /// agent's first, then each app agent's.
+    pub async fn drain_outbox<T: CommitTransport>(
+        &self,
+        transport: &mut T,
+    ) -> AtomicResult<DrainReport> {
+        Outbox::drain_all(&self.db, transport).await
+    }
+
+    /// Ingest a signed JSON-AD commit under `policy`.
+    ///
+    /// - `Hub` / `Peer`: `sync::engine::ingest_commit` with the matching
+    ///   `CommitIngestOpts` — the path `server/src/handlers/commit.rs` and
+    ///   the peer `COMMIT` frame handler already use.
+    /// - `LocalCache`: `Db::apply_commit` with every `validate_*` off — the
+    ///   options the WASM `ClientDb.applyCommit` used to carry inline.
+    pub async fn apply_commit(
+        &self,
+        commit_json: &str,
+        policy: IngestPolicy,
+    ) -> AtomicResult<CommitResponse> {
+        match policy {
+            IngestPolicy::Hub {
+                source_id,
+                response_origin,
+            } => {
+                ingest_commit(
+                    &self.db,
+                    commit_json,
+                    &CommitIngestOpts::hub(source_id, response_origin),
+                )
+                .await
+            }
+            IngestPolicy::Peer => {
+                ingest_commit(&self.db, commit_json, &CommitIngestOpts::peer()).await
+            }
+            IngestPolicy::LocalCache => {
+                // `DontSave`: the default would persist the parsed Commit
+                // resource (validating required props) before `apply_commit`
+                // runs; `apply_commit` is the persistence step here.
+                let commit_resource = crate::parse::parse_json_ad_resource(
+                    commit_json,
+                    &self.db,
+                    &crate::parse::ParseOpts {
+                        save: crate::parse::SaveOpts::DontSave,
+                        ..Default::default()
+                    },
+                )
+                .await?;
+                let commit = crate::Commit::from_resource(commit_resource)?;
+                let opts = crate::commit::CommitOpts {
+                    update_index: true,
+                    ..crate::commit::CommitOpts::no_validations_no_index()
+                };
+                self.db.apply_commit(commit, &opts).await
+            }
+        }
+    }
+}
+
+#[cfg(all(test, feature = "db"))]
+mod tests {
+    use super::*;
+    use crate::db::{
+        kv_store::KvIter,
+        redb_store::RedbStore,
+        trees::{Operation, Tree},
+    };
+    use crate::{
+        agents::ForAgent, client::commit_to_wire_json, db::DbEvent, urls, Resource, Subject, Value,
+    };
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    struct SuppliedStore {
+        inner: RedbStore,
+        batches: AtomicUsize,
+    }
+
+    impl KvStore for SuppliedStore {
+        fn get(&self, tree: Tree, key: &[u8]) -> AtomicResult<Option<Vec<u8>>> {
+            self.inner.get(tree, key)
+        }
+        fn insert(&self, tree: Tree, key: &[u8], value: &[u8]) -> AtomicResult<()> {
+            self.inner.insert(tree, key, value)
+        }
+        fn remove(&self, tree: Tree, key: &[u8]) -> AtomicResult<()> {
+            self.inner.remove(tree, key)
+        }
+        fn contains_key(&self, tree: Tree, key: &[u8]) -> AtomicResult<bool> {
+            self.inner.contains_key(tree, key)
+        }
+        fn scan_prefix(&self, tree: Tree, prefix: &[u8]) -> KvIter {
+            self.inner.scan_prefix(tree, prefix)
+        }
+        fn range(&self, tree: Tree, start: Vec<u8>, end: Vec<u8>, reverse: bool) -> KvIter {
+            self.inner.range(tree, start, end, reverse)
+        }
+        fn iter_tree(&self, tree: Tree) -> KvIter {
+            self.inner.iter_tree(tree)
+        }
+        fn clear_tree(&self, tree: Tree) -> AtomicResult<()> {
+            self.inner.clear_tree(tree)
+        }
+        fn apply_batch(&self, operations: &[Operation]) -> AtomicResult<()> {
+            self.batches.fetch_add(1, Ordering::SeqCst);
+            self.inner.apply_batch(operations)
+        }
+        fn flush(&self) -> AtomicResult<()> {
+            self.inner.flush()
+        }
+        fn begin_batch(&self) {
+            self.inner.begin_batch();
+        }
+        fn commit_batch(&self) -> AtomicResult<()> {
+            self.inner.commit_batch()
+        }
+        fn len(&self, tree: Tree) -> AtomicResult<usize> {
+            self.inner.len(tree)
+        }
+    }
+
+    #[tokio::test]
+    async fn open_with_store_bootstraps_and_reopens_persisted_resources() {
+        let store = Arc::new(SuppliedStore {
+            inner: RedbStore::new_memory().unwrap(),
+            batches: AtomicUsize::new(0),
+        });
+        let node = AtomicNode::open_with_store(store.clone(), Some("https://localhost".into()))
+            .await
+            .unwrap();
+        assert!(node.db().get_resource(&urls::NAME.into()).await.is_ok());
+        assert!(store.len(Tree::Resources).unwrap() > 0);
+        assert!(store.batches.load(Ordering::SeqCst) > 0);
+
+        let (agent, drive) = node.db().setup("Custom backend").await.unwrap();
+        let subject = node
+            .db()
+            .create_resource(urls::FOLDER, &drive, "note", None)
+            .await
+            .unwrap();
+        let name = "A persisted orchid ".repeat(200);
+        let mut resource = node
+            .db()
+            .get_resource(&subject.as_str().into())
+            .await
+            .unwrap();
+        resource
+            .set(urls::NAME.into(), Value::String(name.clone()), node.db())
+            .await
+            .unwrap();
+        node.save_locally(&mut resource).await.unwrap();
+        assert!(node.outbox().has_pending(&subject));
+        drop(node);
+
+        let reopened = AtomicNode::open_with_store(store, Some("https://localhost".into()))
+            .await
+            .unwrap();
+        reopened.set_agent(agent);
+        let result = reopened
+            .query(&Query {
+                property: Some(urls::NAME.into()),
+                value: Some(Value::String(name)),
+                for_agent: ForAgent::Sudo,
+                ..Query::new()
+            })
+            .await
+            .unwrap();
+        assert!(result
+            .resources
+            .iter()
+            .any(|resource| resource.get_subject().pure_id() == subject));
+        assert!(reopened.outbox().has_pending(&subject));
+    }
+
+    async fn open_test_node(label: &str) -> AtomicNode {
+        let db = Db::init_redb(Some("https://localhost".into()))
+            .await
+            .unwrap_or_else(|e| panic!("{label}: open failed: {e}"));
+        db.populate().await.unwrap();
+        AtomicNode::from_db(db)
+    }
+
+    /// A local save through the node is queued for the hub; the same save
+    /// straight on the store is not, which is why bindings go through here.
+    #[tokio::test]
+    async fn save_locally_queues_the_subject_for_the_hub() {
+        let node = open_test_node("outbox").await;
+        let (_alice, drive) = node.db().setup("Alice").await.unwrap();
+        let subject = node
+            .db()
+            .create_resource(urls::FOLDER, &drive, "note", None)
+            .await
+            .unwrap();
+        let mut resource = node
+            .db()
+            .get_resource(&subject.as_str().into())
+            .await
+            .unwrap();
+        resource
+            .set(
+                urls::NAME.into(),
+                Value::String("renamed".into()),
+                node.db(),
+            )
+            .await
+            .unwrap();
+        node.save_locally(&mut resource).await.unwrap();
+        assert!(node.outbox().has_pending(&subject));
+
+        let mut destroy = crate::commit::CommitBuilder::new(subject.as_str().into());
+        destroy.destroy(true);
+        let agent = node.agent().unwrap();
+        let resource = node
+            .db()
+            .get_resource(&subject.as_str().into())
+            .await
+            .unwrap();
+        let commit = destroy.sign(&agent, node.db(), &resource).await.unwrap();
+        let opts = CommitOpts {
+            validate_signature: true,
+            update_index: true,
+            ..CommitOpts::no_validations_no_index()
+        };
+        node.apply_local_commit(commit, &opts).await.unwrap();
+        let entry = node
+            .outbox()
+            .entries()
+            .unwrap()
+            .into_iter()
+            .find(|e| e.subject == crate::Subject::from_raw(&subject, None).pure_id())
+            .expect("entry");
+        assert!(entry.destroy && entry.envelope_json.is_some());
+    }
+
+    /// Two nodes in one process, no Actix: a genesis commit minted on one is
+    /// ingested on the other via `apply_commit(Peer)`, after which `query`
+    /// on the second node reflects it and the store's event channel saw the
+    /// change.
+    #[tokio::test]
+    async fn two_nodes_genesis_then_peer_ingest() {
+        let alice_node = open_test_node("alice").await;
+        let (alice, drive) = alice_node.db().setup("Alice").await.unwrap();
+        let drive = Subject::from(drive);
+        assert_eq!(
+            alice_node.agent().map(|a| a.subject),
+            Some(alice.subject.clone())
+        );
+
+        let bob_node = open_test_node("bob").await;
+        bob_node.db().setup("Bob").await.unwrap();
+        let mut bob_events = bob_node.db().subscribe_events();
+
+        // Alice mints a classless DID document under her drive.
+        let mut draft = Resource::new("did:ad:placeholder".into());
+        draft
+            .set_unsafe(urls::NAME.into(), Value::String("Peer Doc".into()))
+            .unwrap();
+        draft
+            .set_unsafe(urls::PARENT.into(), Value::AtomicUrl(drive.clone()))
+            .unwrap();
+        let response = draft.save_as_genesis(alice_node.db()).await.unwrap();
+        let subject = response.commit.subject.clone();
+        assert!(
+            crate::identifiers::is_atomic_identifier(subject.as_str()),
+            "got {subject}"
+        );
+        assert!(
+            bob_node.db().get_resource(&subject).await.is_err(),
+            "bob must not see alice's write before ingesting it"
+        );
+
+        // Bob already holds Alice's drive, as a replica does after its first
+        // sync. A child arriving for a drive this node does not hold is
+        // refused: nothing here would say Alice may append to it.
+        let alice_drive = alice_node.db().get_resource(&drive).await.unwrap();
+        bob_node
+            .db()
+            .add_resource_opts(&alice_drive, false, true, true)
+            .await
+            .unwrap();
+
+        // The commit crosses the (in-process) wire as JSON-AD.
+        let wire = commit_to_wire_json(&response.commit, alice_node.db())
+            .await
+            .unwrap();
+        let ingested = bob_node
+            .apply_commit(&wire, IngestPolicy::Peer)
+            .await
+            .expect("bob must accept alice's signed genesis commit under Peer policy");
+        assert_eq!(ingested.commit.signer, alice.subject);
+
+        // The store sees it (as sudo: bob has no rights on alice's doc).
+        let got = bob_node
+            .db()
+            .get_resource_extended(&subject, false, &ForAgent::Sudo)
+            .await
+            .unwrap()
+            .to_single();
+        assert_eq!(got.get(urls::NAME).unwrap().to_string(), "Peer Doc");
+
+        // `query` sees it.
+        let result = bob_node
+            .query(&Query {
+                property: Some(urls::PARENT.into()),
+                value: Some(Value::AtomicUrl(drive.clone())),
+                for_agent: ForAgent::Sudo,
+                ..Query::new()
+            })
+            .await
+            .unwrap();
+        assert_eq!(result.subjects, vec![subject.clone()]);
+
+        // The event channel saw the ingest: the ingest stores the commit
+        // resource and the document, each emitting a `Changed` event.
+        let mut changed = Vec::new();
+        while let Ok(event) = bob_events.try_recv() {
+            if let DbEvent::Changed { subject, .. } = event {
+                changed.push(subject.pure_id());
+            }
+        }
+        assert!(
+            changed.contains(&subject.pure_id()),
+            "expected a Changed event for {subject}, got {changed:?}"
+        );
+    }
+
+    /// `LocalCache` is today's WASM `applyCommit`: it applies an unsigned,
+    /// unauthorized commit without complaint, because the cache trusts its
+    /// hub. `Peer` must reject the very same bytes.
+    #[tokio::test]
+    async fn local_cache_skips_validation_peer_does_not() {
+        let hub = open_test_node("hub").await;
+        let (_alice, drive) = hub.db().setup("Alice").await.unwrap();
+        let drive = Subject::from(drive);
+        let mut draft = Resource::new("did:ad:placeholder".into());
+        draft
+            .set_unsafe(urls::NAME.into(), Value::String("Cached".into()))
+            .unwrap();
+        draft
+            .set_unsafe(urls::PARENT.into(), Value::AtomicUrl(drive))
+            .unwrap();
+        let response = draft.save_as_genesis(hub.db()).await.unwrap();
+        // What the hub pushes to its caches over WS: the stored commit
+        // resource, `@id` included (`ingest_commit_json`'s return value).
+        let mut wire: serde_json::Value =
+            serde_json::from_str(&response.commit_resource.to_json_ad(None).unwrap()).unwrap();
+        // Corrupt the signature: a peer must notice, a local cache does not check.
+        wire[urls::SIGNATURE] = serde_json::Value::String("AAAA".into());
+        let tampered = wire.to_string();
+
+        let cache = open_test_node("cache").await;
+        cache
+            .apply_commit(&tampered, IngestPolicy::LocalCache)
+            .await
+            .expect("LocalCache applies without validating the signature");
+        cache
+            .db()
+            .get_resource_extended(&response.commit.subject, false, &ForAgent::Sudo)
+            .await
+            .expect("cached resource is readable");
+
+        let peer = open_test_node("peer").await;
+        peer.apply_commit(&tampered, IngestPolicy::Peer)
+            .await
+            .expect_err("Peer validates the signature and must reject the tampered commit");
+    }
+}

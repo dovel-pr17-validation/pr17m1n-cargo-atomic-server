@@ -1,0 +1,69 @@
+//! Signed access to a connection's private reconciliation state.
+use crate::{
+    appstate::AppState,
+    context::RequestContext,
+    errors::AtomicServerResult,
+    plugins::{connection_state, js_runtime::StoreHost},
+};
+use actix_web::{web, HttpResponse};
+
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Target {
+    pub drive: String,
+    pub plugin: String,
+}
+async fn authorize(
+    appstate: &AppState,
+    req: &actix_web::HttpRequest,
+    context: &RequestContext,
+    raw: &[u8],
+    target: &Target,
+) -> AtomicServerResult<()> {
+    let account =
+        crate::helpers::authorize_plugin_write(appstate, req, context, raw, &target.plugin).await?;
+    StoreHost::bound(
+        &appstate.store,
+        &target.drive,
+        &target.plugin,
+        account,
+        None,
+    )
+    .await?;
+    Ok(())
+}
+pub async fn read(
+    appstate: web::Data<AppState>,
+    raw: web::Bytes,
+    req: actix_web::HttpRequest,
+    context: RequestContext,
+) -> AtomicServerResult<HttpResponse> {
+    let body: Target = crate::helpers::parse_json(&raw)?;
+    authorize(&appstate, &req, &context, &raw, &body).await?;
+    Ok(HttpResponse::Ok()
+        .json(connection_state::read_resolved(&appstate.store, &body.drive, &body.plugin).await?))
+}
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Update {
+    pub target: Target,
+    pub checkpoint: connection_state::Checkpoint,
+}
+pub async fn checkpoint(
+    appstate: web::Data<AppState>,
+    raw: web::Bytes,
+    req: actix_web::HttpRequest,
+    context: RequestContext,
+) -> AtomicServerResult<HttpResponse> {
+    let body: Update = crate::helpers::parse_json(&raw)?;
+    authorize(&appstate, &req, &context, &raw, &body.target).await?;
+    Ok(HttpResponse::Ok().json(
+        connection_state::checkpoint(
+            &appstate.store,
+            &body.target.drive,
+            &body.target.plugin,
+            body.checkpoint,
+        )
+        .await?,
+    ))
+}

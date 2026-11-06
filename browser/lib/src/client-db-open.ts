@@ -1,0 +1,156 @@
+/**
+ * Opening the WASM ClientDb, with self-healing for an OPFS file that cannot be
+ * decrypted with the key we have.
+ *
+ * Each signed-in agent gets its own OPFS file encrypted under a per-agent key
+ * (see the data-browser's `localDbKey.ts`). If that key is ever lost — site
+ * data cleared, the identity re-created, an interrupted key migration — the
+ * existing file stays behind and every open fails with "wrong encryption key
+ * for local database", on every page load, forever.
+ *
+ * Throwing that file away and starting a fresh one under the current key is
+ * the only way out of that loop, but it is only safe when the key really is
+ * gone. It used to be unconditional, justified as "everything in it is
+ * re-fetchable from the server". That is true of a cache of a server-backed
+ * drive and false of a local-only drive, whose sole copy this file is; and the
+ * key is not always as lost as a failed open suggests, because the per-agent
+ * key has a durable wrapped record that only a sign-in with the agent secret
+ * unwraps. Deleting while that record exists destroys data whose key was about
+ * to come back.
+ *
+ * So the caller decides, via `discardUndecryptable`, and the default is to keep
+ * the file and let the open fail. Callers holding an encrypted database pass
+ * true only when they can show the key is unrecoverable — for the data-browser,
+ * that no wrapped record exists (`helpers/initClientDb.ts`).
+ *
+ * Deliberately narrow. Deletion requires ALL of:
+ *   - `discardUndecryptable`, the caller's assertion that the key is gone for
+ *     good rather than merely absent from this page load,
+ *   - the WASM side tagged the failure with `WRONG_KEY_MARKER` (only the header
+ *     key check does that — a corrupt file, an unsupported version, or an
+ *     unavailable OPFS produce untagged errors),
+ *   - a `dbKey`, so the shared plaintext anonymous database is never a target,
+ *   - a `dbName`, so we only ever delete the exact file we just tried to open —
+ *     never another agent's.
+ * Anything else rethrows untouched.
+ */
+
+/**
+ * Token spliced into the error message by `ClientDb::open`. Keep in sync with
+ * `WRONG_KEY_MARKER` in `wasm/src/lib.rs`.
+ */
+export const WRONG_KEY_MARKER = 'ATOMIC_DB_WRONG_KEY';
+
+/** The subset of the generated WASM module that opening a database needs. */
+export interface ClientDbWasm {
+  ClientDb: {
+    /**
+     * wasm-bindgen renders this async factory as a static method rather than
+     * a `new`-able constructor — async constructors produce invalid TS.
+     */
+    open(
+      baseUrl?: string,
+      dbName?: string,
+      dbKey?: Uint8Array,
+    ): Promise<unknown>;
+  };
+  /** Added alongside the self-heal; absent in older WASM builds. */
+  deleteClientDb?: (dbName: string) => Promise<boolean>;
+}
+
+export interface OpenClientDbOptions {
+  baseUrl?: string;
+  dbName?: string;
+  dbKey?: Uint8Array;
+  /**
+   * Whether an undecryptable file may be discarded and recreated.
+   *
+   * Defaults to false: a failed decrypt says the key we have is wrong, not
+   * that the right one is gone, and the file may be the only copy of a
+   * local-only drive. Pass true only having established that no path back to
+   * the key remains.
+   */
+  discardUndecryptable?: boolean;
+}
+
+export interface OpenClientDbResult {
+  db: unknown;
+  /** Whether an undecryptable file had to be discarded and recreated. */
+  recreated: boolean;
+}
+
+/**
+ * Whether this open failure means "the file exists, is a valid encrypted
+ * database, and this key does not open it" — the single recoverable case.
+ */
+export function isWrongKeyDbError(error: unknown): boolean {
+  const message = error instanceof Error ? error.message : String(error);
+
+  return message.includes(WRONG_KEY_MARKER);
+}
+
+/**
+ * Token spliced into the error message by `ClientDb::open` when the browser
+ * refuses this origin storage outright. Keep in sync with
+ * `STORAGE_BLOCKED_MARKER` in `wasm/src/lib.rs`.
+ */
+export const STORAGE_BLOCKED_MARKER = 'ATOMIC_DB_STORAGE_BLOCKED';
+
+/**
+ * Whether the local database is unavailable because the browser is withholding
+ * storage from this origin — Safari private browsing, tracking prevention on a
+ * partitioned origin, or site data blocked by the user.
+ *
+ * This is a property of the browsing session, not of our data: there is
+ * nothing to repair, nothing to delete, and retrying cannot help. Callers
+ * degrade to server-only mode and say so in one sentence, rather than logging
+ * a wasm stack trace on every page load for a state the user may have chosen.
+ */
+export function isStorageBlockedDbError(error: unknown): boolean {
+  const message = error instanceof Error ? error.message : String(error);
+
+  return message.includes(STORAGE_BLOCKED_MARKER);
+}
+
+/**
+ * Open the OPFS-backed ClientDb, recreating it once if the existing file is
+ * undecryptable. Any other failure — and any failure of the retry itself —
+ * propagates to the caller.
+ */
+export async function openClientDb(
+  wasm: ClientDbWasm,
+  { baseUrl, dbName, dbKey, discardUndecryptable = false }: OpenClientDbOptions,
+): Promise<OpenClientDbResult> {
+  try {
+    return {
+      db: await wasm.ClientDb.open(baseUrl, dbName, dbKey),
+      recreated: false,
+    };
+  } catch (e) {
+    if (
+      !discardUndecryptable ||
+      !isWrongKeyDbError(e) ||
+      !dbName ||
+      !dbKey ||
+      typeof wasm.deleteClientDb !== 'function'
+    ) {
+      throw e;
+    }
+
+    console.warn(
+      `[ClientDb] local cache ${dbName} cannot be decrypted with this ` +
+        "agent's key (the key was lost, or the identity was re-created). " +
+        'Discarding the file and rebuilding the cache from the server.',
+      e,
+    );
+
+    await wasm.deleteClientDb(dbName);
+
+    // No second recovery attempt: a fresh file opens or something else is
+    // wrong, and a delete loop would be worse than a clear error.
+    return {
+      db: await wasm.ClientDb.open(baseUrl, dbName, dbKey),
+      recreated: true,
+    };
+  }
+}

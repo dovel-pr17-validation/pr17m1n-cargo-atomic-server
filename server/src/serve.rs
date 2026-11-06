@@ -1,0 +1,764 @@
+use actix_web::{
+    body::MessageBody,
+    dev::{ServiceRequest, ServiceResponse},
+    middleware, web, Error, HttpServer,
+};
+use atomic_lib::Storelike;
+use tracing_actix_web::{DefaultRootSpanBuilder, RootSpanBuilder};
+
+/// Actix's connection limit is per worker (25,000 by default), while the OS
+/// descriptor limit is shared by the whole process. Leave at least a quarter
+/// of that limit, or 128 descriptors, for the database, Iroh, Sentry, and
+/// listener sockets. A very small process limit cannot provide that reserve;
+/// still allow one HTTP connection per worker so startup can report the issue.
+fn http_connections_per_worker(soft_limit: usize, workers: usize) -> usize {
+    let reserve = (soft_limit / 4).max(128);
+    soft_limit
+        .saturating_sub(reserve)
+        .checked_div(workers.max(1))
+        .unwrap_or(0)
+        .clamp(1, 1024)
+}
+
+#[cfg(unix)]
+fn process_fd_soft_limit() -> Option<usize> {
+    let mut limit = std::mem::MaybeUninit::<libc::rlimit>::uninit();
+    // SAFETY: getrlimit writes the initialized rlimit into this valid pointer
+    // on success. We only read it after checking the return value.
+    if unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, limit.as_mut_ptr()) } != 0 {
+        return None;
+    }
+    let limit = unsafe { limit.assume_init() };
+    usize::try_from(limit.rlim_cur).ok()
+}
+
+#[cfg(not(unix))]
+fn process_fd_soft_limit() -> Option<usize> {
+    None
+}
+
+/// Raise this process's file-descriptor soft limit to its hard limit.
+///
+/// A process may do this for itself without privileges, and the two are
+/// usually far apart: a soft limit of 1024 against a hard limit in the
+/// hundreds of thousands. The budget below divides the soft limit among HTTP
+/// workers, but HTTP is not the only tenant. The database, Iroh's QUIC
+/// sockets and every open websocket draw on the same pool, so on a stock 1024
+/// the process can exhaust it while the HTTP budget still looks healthy.
+/// Staging did exactly that: twenty-three minutes of `error accepting
+/// connection: No file descriptors available`, Iroh unable to bind its
+/// hairpin probe, and a panic at the tail, all from one `EMFILE`.
+///
+/// Raising before reading is what makes the reserve generous rather than
+/// cramped. Failure is not fatal: the budget is computed from whatever limit
+/// is in force afterwards either way.
+#[cfg(unix)]
+fn raise_fd_soft_limit() {
+    let mut limit = std::mem::MaybeUninit::<libc::rlimit>::uninit();
+    // SAFETY: getrlimit writes the initialized rlimit into this valid pointer
+    // on success. We only read it after checking the return value.
+    if unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, limit.as_mut_ptr()) } != 0 {
+        tracing::warn!("Could not read the file-descriptor limit to raise it");
+
+        return;
+    }
+    let current = unsafe { limit.assume_init() };
+
+    if current.rlim_cur >= current.rlim_max {
+        return;
+    }
+
+    let raised = libc::rlimit {
+        rlim_cur: current.rlim_max,
+        rlim_max: current.rlim_max,
+    };
+
+    // SAFETY: setrlimit reads an rlimit through this valid pointer. Raising the
+    // soft limit as far as the hard limit requires no privileges.
+    if unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &raised) } == 0 {
+        tracing::info!(
+            from = current.rlim_cur,
+            to = current.rlim_max,
+            "Raised the file-descriptor soft limit to the hard limit"
+        );
+    } else {
+        tracing::warn!(
+            soft = current.rlim_cur,
+            hard = current.rlim_max,
+            "Could not raise the file-descriptor soft limit; continuing on the soft limit"
+        );
+    }
+}
+
+#[cfg(not(unix))]
+fn raise_fd_soft_limit() {}
+
+/// Custom span builder: uses "{method} {path}" when no route pattern is matched
+/// (e.g. static files), so spans are legible in SigNoz instead of just "GET".
+struct AtomicRootSpanBuilder;
+
+impl RootSpanBuilder for AtomicRootSpanBuilder {
+    fn on_request_start(request: &ServiceRequest) -> tracing::Span {
+        if request.match_pattern().is_none() {
+            let name = format!("{} {}", request.method(), request.path());
+            return tracing::info_span!("HTTP request", "otel.name" = name, "http.method" = %request.method(), "http.target" = %request.path());
+        }
+        DefaultRootSpanBuilder::on_request_start(request)
+    }
+
+    fn on_request_end<B: MessageBody>(
+        span: tracing::Span,
+        outcome: &Result<ServiceResponse<B>, Error>,
+    ) {
+        DefaultRootSpanBuilder::on_request_end(span, outcome);
+    }
+}
+
+use crate::errors::AtomicServerResult;
+
+/// Clears and rebuilds the Store & Search indexes
+async fn rebuild_indexes(
+    appstate: &crate::appstate::AppState,
+    mode: &crate::config::RebuildIndexMode,
+) -> AtomicServerResult<()> {
+    if matches!(
+        mode,
+        crate::config::RebuildIndexMode::All | crate::config::RebuildIndexMode::Atoms
+    ) {
+        let appstate_clone = appstate.clone();
+
+        actix_web::rt::spawn(async move {
+            appstate_clone
+                .store
+                .clear_index()
+                .expect("Failed to clear value index");
+            appstate_clone
+                .store
+                .build_index(true)
+                .expect("Failed to build value index");
+        });
+    }
+
+    if matches!(
+        mode,
+        crate::config::RebuildIndexMode::All | crate::config::RebuildIndexMode::Search
+    ) {
+        tracing::info!("Rebuilding full-text search index...");
+        atomic_lib::search::build_search_index(&appstate.store)?;
+    }
+
+    if matches!(
+        mode,
+        crate::config::RebuildIndexMode::All | crate::config::RebuildIndexMode::Vector
+    ) {
+        #[cfg(not(feature = "vector-search"))]
+        tracing::warn!(
+            "Vector index rebuild requested but this build was compiled without the vector-search feature"
+        );
+        #[cfg(feature = "vector-search")]
+        if appstate.vector_search_state.is_enabled() {
+            tracing::info!("Removing existing vector search index...");
+            // vector search index was already wiped in VectorSearchState::new if rebuild_indexes was passed
+
+            appstate
+                .vector_search_state
+                .add_all_resources(&appstate.store)
+                .await?;
+        } else {
+            tracing::warn!(
+                "Vector index rebuild requested but vector search is disabled; pass --enable-vector-index too"
+            );
+        }
+    }
+
+    Ok(())
+}
+
+/// Removes all remote resources from the store.
+async fn clear_remote_cache(appstate: &crate::appstate::AppState) -> AtomicServerResult<()> {
+    tracing::info!("Removing remote resources...");
+    let mut count = 0;
+    let mut subjects_to_remove = Vec::new();
+    for resource in appstate.store.all_resources(true) {
+        let subject = resource.get_subject();
+        if matches!(subject, atomic_lib::Subject::External(_)) {
+            subjects_to_remove.push(subject.clone());
+        }
+    }
+
+    for subject in subjects_to_remove {
+        appstate.store.remove_resource(&subject).await?;
+        let _ = appstate
+            .vector_search_state
+            .remove_resource(subject.as_str())
+            .await;
+        count += 1;
+    }
+
+    tracing::info!("Successfully removed {} remote resources.", count);
+    Ok(())
+}
+
+/// Marker in the description of dev-drives (see
+/// `browser/data-browser/src/hooks/useDevDrive.ts` /
+/// `server/src/plugins/prunetests.rs`). Skipped during Pkarr announcement to
+/// avoid broadcasting throwaway test drives to the DHT.
+const DEV_DRIVE_MARKER: &str = "[atomic-data:dev-drive]";
+
+/// How often the pkarr records are published again. A record that is only
+/// published once at boot expires from the relay, so a long-running server
+/// refreshes it.
+const PKARR_REANNOUNCE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(3600);
+
+/// Publish this server's Iroh NodeID and public https origin to the pkarr DHT, one record per drive
+/// it hosts. Pkarr keys the record by a keypair derived from the drive's DID
+/// (see `atomic_lib::discovery::publish_node_id`), so clients resolving a
+/// `?drive=did:ad:...` hint can find the node(s) hosting that specific drive.
+///
+/// Dev-drives are skipped (they accumulate by the hundreds during
+/// development and publishing each is pure noise).
+async fn announce_drives_pkarr(
+    appstate: &crate::appstate::AppState,
+    node_id: Option<&str>,
+    http_origin: Option<&str>,
+) -> Result<(), String> {
+    use atomic_lib::Storelike;
+
+    let mut published = 0;
+    let mut skipped_dev = 0;
+    for resource in appstate.store.all_resources(false) {
+        if let Ok(classes_val) = resource.get(atomic_lib::urls::IS_A) {
+            if let Ok(classes) = classes_val.to_subjects(None) {
+                if !classes.contains(&atomic_lib::urls::DRIVE.to_string()) {
+                    continue;
+                }
+            } else {
+                continue;
+            }
+        } else {
+            continue;
+        }
+
+        let is_dev = match resource.get(atomic_lib::urls::DESCRIPTION) {
+            Ok(v) => v.to_string().contains(DEV_DRIVE_MARKER),
+            Err(_) => false,
+        };
+        if is_dev {
+            skipped_dev += 1;
+            continue;
+        }
+
+        let drive_did = resource.get_subject().as_str();
+        // Drives have `atomic:{genesis}` (or legacy `did:ad:{genesis}`)
+        // subjects. The publish_node_id derivation assumes exactly that
+        // shape — bail early for any other kind of drive resource rather
+        // than producing a bad pkarr keypair.
+        if !atomic_lib::identifiers::is_resource_id(drive_did) {
+            continue;
+        }
+
+        match atomic_lib::discovery::publish_drive_record(drive_did, node_id, http_origin).await {
+            Ok(_) => published += 1,
+            Err(e) => tracing::warn!("Pkarr: failed for drive {drive_did}: {e}"),
+        }
+    }
+    tracing::info!(
+        "Pkarr: announced {} drives ({} dev-drives skipped)",
+        published,
+        skipped_dev
+    );
+    Ok(())
+}
+
+// Increase the maximum payload size (for POSTing a body, for example) to 50MB
+pub(crate) const PAYLOAD_MAX: usize = 50_242_880;
+pub(crate) const SERVER_VERSION_HEADER: &str = "X-Atomic-Server-Version";
+const SERVER_VERSION: &str = env!("CARGO_PKG_VERSION");
+
+/// Start the server
+pub async fn serve(config: crate::config::Config) -> AtomicServerResult<()> {
+    serve_with_hook(config, |_appstate| {}).await
+}
+
+/// Like [`serve`], but invokes `on_ready(&AppState)` once the store, indexes and
+/// transports are up but before the HTTP server begins accepting connections.
+/// Embedders (e.g. a managed-node wrapper) use this to install a sync policy and
+/// spawn background tasks without forking the server. Self-hosted use goes
+/// through [`serve`] with a no-op hook.
+pub async fn serve_with_hook<F>(
+    config: crate::config::Config,
+    on_ready: F,
+) -> AtomicServerResult<()>
+where
+    F: FnOnce(&crate::appstate::AppState),
+{
+    println!(
+        "Atomic-server {} \nUse --help for instructions. Visit https://docs.atomicdata.dev and https://github.com/atomicdata-dev/atomic-server for more info.",
+        env!("CARGO_PKG_VERSION")
+    );
+
+    // rustls 0.23 will not choose a CryptoProvider for itself when more than
+    // one is compiled in, and both `ring` and `aws-lc-rs` reach us through the
+    // dependency graph regardless of our own features. Without an explicit
+    // choice, the first rustls call panics -- and the first rustls call is the
+    // ACME path, so a server whose certificates have expired does not fail to
+    // renew, it fails to BOOT. Staging died exactly this way (status 101 on
+    // every restart until systemd gave up).
+    //
+    // Installed here rather than in bin.rs because the desktop app and the
+    // managed-node wrapper embed this function instead of going through main().
+    // Ignoring the error is intentional: it only reports that a provider was
+    // already installed, which is the outcome we want anyway.
+    #[cfg(feature = "rustls")]
+    {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+    }
+
+    // Sentry first, so the tracing layer below has a client to report to.
+    // The guard is held until the end of this function; dropping it flushes.
+    let _sentry_guard = crate::trace::init_sentry(&config);
+    let tracing_chrome_flush_guard = crate::trace::init_tracing(&config);
+
+    // Setup the database and more
+    let appstate = crate::appstate::AppState::init(config.clone()).await?;
+
+    // Start async processes
+    if let Some(ref mode) = config.opts.rebuild_indexes {
+        rebuild_indexes(&appstate, mode).await?;
+    }
+    if config.opts.clear_remote_cache {
+        clear_remote_cache(&appstate).await?;
+    }
+
+    // Persist a configured device name so peers see something friendly in
+    // their `HELLO` frames. Mirrors what the flutter app sets via its UI —
+    // same DB key, same accessor — but driven from CLI/env so server
+    // operators don't need a separate tool to brand a node.
+    if let Some(name) = config
+        .opts
+        .device_name
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
+        atomic_lib::sync::peer::set_device_name(&appstate.store, name);
+    }
+
+    // Presence arriving from peers → the local websocket clients.
+    //
+    // Deliberately its own channel rather than `db_events`: presence must never
+    // be written, and every consumer of a DbEvent writes or indexes. Cursor
+    // positions merged into the CRDT would persist and sync forever.
+    //
+    // `addr: None` marks the update as relayed, which is what stops the
+    // broadcaster sending it straight back out to peers — presence arrives at
+    // cursor frequency, so an echo here would saturate the link far faster than
+    // resource changes could.
+    {
+        let store = appstate.store.clone();
+        let broadcaster = appstate.commit_monitor.clone();
+        let mut rx = store.subscribe_ephemeral();
+        actix_web::rt::spawn(async move {
+            loop {
+                match rx.recv().await {
+                    Ok(event) => {
+                        let subject = atomic_lib::Subject::from_raw(
+                            &event.drive,
+                            store.get_base_domain().as_deref(),
+                        );
+                        let agent = event.agent;
+                        let update = event.payload;
+
+                        // Each channel fans out to a different subscriber set,
+                        // so a relayed frame has to re-enter through the same
+                        // one it left by.
+                        match event.kind {
+                            atomic_lib::sync::protocol::ephemeral_kind::PRESENCE => {
+                                broadcaster.do_send(crate::actor_messages::RemotePresenceUpdate {
+                                    subject,
+                                    agent,
+                                    update,
+                                });
+                            }
+                            atomic_lib::sync::protocol::ephemeral_kind::DOC => {
+                                broadcaster.do_send(crate::actor_messages::LoroSyncUpdate {
+                                    subject,
+                                    agent,
+                                    update,
+                                    addr: None,
+                                });
+                            }
+                            _ => {
+                                broadcaster.do_send(crate::actor_messages::LoroEphemeralUpdate {
+                                    subject,
+                                    agent,
+                                    update,
+                                    addr: None,
+                                });
+                            }
+                        }
+                    }
+                    // Presence is the first thing worth dropping under load, so
+                    // lagging is expected and not an error: skip what was
+                    // missed and carry on with the current cursors.
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
+                        tracing::debug!("[presence] dropped {n} frames under load");
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                }
+            }
+        });
+    }
+
+    // The durable-flush tick that makes Durability::None commits survive a
+    // crash is owned by `atomic_lib` (`Db::init_redb_file` spawns it), so the
+    // desktop and Flutter bindings get it without remembering to.
+
+    // The NodeID to announce through pkarr, set once Iroh is up.
+    let mut pkarr_node_id: Option<String> = None;
+
+    // Start Iroh peer-to-peer transport
+    let _iroh_router = {
+        let store = appstate.store.clone();
+        match atomic_lib::sync::peer::start(store.clone()).await {
+            Ok((node_id, router)) => {
+                tracing::info!(
+                    "Iroh transport ready as \"{}\". Connect with: {}",
+                    atomic_lib::sync::peer::effective_device_name(&store),
+                    atomic_lib::identifiers::node_subject(&node_id.to_string())
+                );
+
+                pkarr_node_id = Some(node_id.to_string());
+
+                // Apps this node lacks may run on a peer, and peers' calls run
+                // here (planning/host-abi.md, step 6).
+                #[cfg(feature = "wasm-plugins")]
+                {
+                    use crate::plugins::host_abi::{IrohForwarder, ServedCalls};
+                    appstate
+                        .host_abi
+                        .set_forwarder(std::sync::Arc::new(IrohForwarder::node()));
+                    atomic_lib::sync::call::set_call_handler(std::sync::Arc::new(ServedCalls {
+                        registry: appstate.host_abi.clone(),
+                    }));
+                }
+
+                Some(router)
+            }
+            Err(e) => {
+                tracing::warn!("Failed to start Iroh transport: {e}");
+                None
+            }
+        }
+    };
+
+    // Announce this server through the pkarr relay, one record per drive: its
+    // NodeID (when Iroh is up) and its public https origin (when it has one),
+    // so a browser that only knows the person's secret can find it. Repeated
+    // hourly because the record expires.
+    {
+        let appstate_clone = appstate.clone();
+        let http_origin = atomic_lib::discovery::public_https_origin(&appstate.config.get_origin());
+        if pkarr_node_id.is_some() || http_origin.is_some() {
+            actix_web::rt::spawn(async move {
+                let mut interval = actix_web::rt::time::interval(PKARR_REANNOUNCE_INTERVAL);
+                loop {
+                    interval.tick().await;
+                    if let Err(e) = announce_drives_pkarr(
+                        &appstate_clone,
+                        pkarr_node_id.as_deref(),
+                        http_origin.as_deref(),
+                    )
+                    .await
+                    {
+                        tracing::warn!("Pkarr announcement failed: {e}");
+                    }
+                }
+            });
+        }
+    }
+
+    // Catch up any drive the user asked us to replicate elsewhere. A target is
+    // standing config, not a one-shot command, so anything committed while the
+    // remote was unreachable is pushed now. This only ever contacts servers the
+    // user explicitly named — a store with no targets does nothing at all, so it
+    // is not a phone-home.
+    let replication_store = appstate.store.clone();
+    actix_web::rt::spawn(async move {
+        crate::plugins::replicate::reconcile_replication_targets(&replication_store).await;
+    });
+
+    // Deletes file blobs nothing references any more, in the background.
+    crate::blob_storage::spawn_gc(appstate.clone())?;
+
+    // Runs plugins nobody is watching. Sleeps on a server with no schedules.
+    #[cfg(feature = "wasm-plugins")]
+    crate::plugins::scheduler::spawn(appstate.clone());
+
+    // Runs plugins because the data moved. Idle on a server with no triggers.
+    #[cfg(feature = "wasm-plugins")]
+    crate::plugins::triggers::spawn(appstate.clone());
+    #[cfg(feature = "wasm-plugins")]
+    crate::plugins::sync_worker::spawn(appstate.clone());
+
+    // Embedder hook: the store, indexes and transports are up, but the HTTP
+    // server hasn't started accepting connections yet. A managed-node wrapper
+    // (atomic-saas/managed-node) uses this to flip the `managed` flag, install
+    // its sync admission policy, and spawn its control-plane tasks. The open
+    // server passes a no-op (see `serve`), so it never phones home.
+    on_ready(&appstate);
+
+    raise_fd_soft_limit();
+    let fd_soft_limit = process_fd_soft_limit().unwrap_or_else(|| {
+        tracing::warn!("Could not read the process file-descriptor limit; budgeting HTTP connections against 1024 descriptors");
+        1024
+    });
+    // Match Actix's default worker calculation, then keep the worker count
+    // itself bounded. On a low-limit host, too many worker runtimes consume
+    // the reserve before any clients arrive.
+    let workers = std::thread::available_parallelism()
+        .map_or(2, std::num::NonZeroUsize::get)
+        .min((fd_soft_limit / 128).max(1))
+        .min(8);
+    let max_connections = http_connections_per_worker(fd_soft_limit, workers);
+    tracing::info!(
+        fd_soft_limit,
+        workers,
+        max_connections_per_worker = max_connections,
+        max_http_connections = workers * max_connections,
+        "HTTP connection budget"
+    );
+    if fd_soft_limit < 256 {
+        tracing::warn!(
+            fd_soft_limit,
+            "Process file-descriptor limit leaves little headroom for HTTP and background services"
+        );
+    }
+
+    let server = HttpServer::new(move || {
+        actix_web::App::new()
+            .app_data(web::PayloadConfig::new(PAYLOAD_MAX))
+            .app_data(web::Data::new(appstate.clone()))
+            .wrap(crate::cors::any_origin())
+            // Outside the CORS layer, so it sees the headers CORS added:
+            // credentials only for origins this server answers for.
+            .wrap(middleware::from_fn(crate::cors::credentials_gate))
+            // Attaches the request (method, url, headers) to any Sentry event
+            // raised while handling it, and reports handler panics and 5xx
+            // errors. No-op without a bound Sentry client.
+            .wrap(sentry_actix::Sentry::new())
+            .wrap(middleware::DefaultHeaders::new().add((SERVER_VERSION_HEADER, SERVER_VERSION)))
+            .wrap(tracing_actix_web::TracingLogger::<AtomicRootSpanBuilder>::new())
+            .wrap(middleware::Compress::default())
+            .configure(crate::handlers::website::content_routes)
+            // Here are the actual handlers / endpoints
+            .configure(crate::routes::config_routes)
+            // Anything no route claims: a wrong method on a known path, a
+            // typo, a scanner. Normal traffic, so no `error!`.
+            .default_service(web::to(|req: actix_web::HttpRequest| async move {
+                tracing::debug!("No route for {} {}", req.method(), req.path());
+                actix_web::HttpResponse::NotFound().finish()
+            }))
+            .app_data(
+                web::JsonConfig::default()
+                    // register error_handler for JSON extractors.
+                    .error_handler(crate::jsonerrors::json_error_handler),
+            )
+    })
+    .workers(workers)
+    .max_connections(max_connections);
+
+    let protocol = if config.opts.https { "https" } else { "http" };
+    let port = if config.opts.https {
+        config.opts.port_https
+    } else {
+        config.opts.port
+    };
+    let mut message = format!(
+        "{}\n\nVisit {}://{}:{}\n",
+        BANNER, protocol, config.opts.domain, port
+    );
+
+    if config.opts.ip.is_unspecified() {
+        message.push_str("\nAlso available on your local network at:\n");
+        if let Ok(network_interfaces) = local_ip_address::list_afinet_netifas() {
+            for (name, ip) in network_interfaces.iter() {
+                if ip.is_ipv4() && !ip.is_loopback() {
+                    message.push_str(&format!("- {}://{}:{} ({})\n", protocol, ip, port, name));
+                }
+            }
+        }
+        message.push('\n');
+    } else {
+        message.push('\n');
+    }
+
+    // Always say which it is. A node that silently changed who may write to it
+    // would be worse than one that never gated at all.
+    match config.host_mode.mode {
+        crate::host_mode::HostMode::Owner => {
+            message.push_str(&format!(
+                "Only its owner can create new Drives here ({}).\n\n",
+                config
+                    .host_mode
+                    .owner_agent
+                    .as_deref()
+                    .unwrap_or("no owner set")
+            ));
+        }
+        crate::host_mode::HostMode::Open => {
+            let reachability = config.reachability();
+
+            if reachability.looks_exposed() && config.opts.host_mode.is_none() {
+                let warning = crate::host_mode::exposure_warning(reachability);
+                // Both, deliberately: the banner is what someone watching the
+                // terminal sees, and the `warn!` is what survives into
+                // journalctl for someone reading back later.
+                tracing::warn!("{}", warning);
+                message.push_str(&format!("{}\n\n", warning));
+            } else {
+                message.push_str("Anyone who can reach this node can create a Drive on it.\n\n");
+            }
+        }
+    }
+
+    if config.opts.https {
+        if cfg!(feature = "https") {
+            #[cfg(feature = "https")]
+            {
+                // If there is no certificate file, or the certs are too old, start HTTPS initialization
+                {
+                    if crate::https::should_renew_certs_check(&config)? {
+                        crate::https::request_cert(&config).await?;
+                    }
+                }
+                let https_config = crate::https::get_https_config(&config)
+                    .expect("HTTPS TLS Configuration with Let's Encrypt failed.");
+                spawn_cert_renewal_task(config.clone());
+                let endpoint = format!("{}:{}", config.opts.ip, config.opts.port_https);
+                tracing::info!("Binding HTTPS server to endpoint {}", endpoint);
+                println!("{}", message);
+                server
+                    .bind_rustls_0_23(&endpoint, https_config)
+                    .map_err(|e| format!("Cannot bind to endpoint {}: {}", endpoint, e))?
+                    .shutdown_timeout(TIMEOUT)
+                    .run()
+                    .await?;
+            }
+        } else {
+            return Err("The HTTPS feature has been disabled for this build. Please compile atomic-server with the HTTP feature. `cargo install atomic-server`".into());
+        }
+    } else {
+        let endpoint = format!("{}:{}", config.opts.ip, config.opts.port);
+        tracing::info!("Binding HTTP server to endpoint {}", endpoint);
+        println!("{}", message);
+        server
+            .bind(&endpoint)
+            .map_err(|e| format!("Cannot bind to endpoint {}: {}", endpoint, e))?
+            .shutdown_timeout(TIMEOUT)
+            .run()
+            .await?;
+    }
+
+    tracing::info!("Cleaning up");
+    // Cleanup, runs when server is stopped
+    // Note that more cleanup code is in Appstate::exit
+    if let Some(guard) = tracing_chrome_flush_guard {
+        guard.flush()
+    }
+
+    tracing::info!("Server stopped");
+    Ok(())
+}
+
+/// Amount of seconds before server shuts down connections after SIGTERM signal
+const TIMEOUT: u64 = 15;
+
+/// Once a day, checks whether the Let's Encrypt certificate is due for
+/// renewal (`should_renew_certs_check`: older than four weeks) and requests a
+/// new one. The certificate only lands on disk: the running rustls config
+/// keeps serving the old one, so the server has to be restarted to pick it
+/// up. Before this, a long-running server never renewed at all.
+#[cfg(feature = "https")]
+fn spawn_cert_renewal_task(config: crate::config::Config) {
+    actix_web::rt::spawn(async move {
+        let mut interval = tokio::time::interval(std::time::Duration::from_secs(24 * 60 * 60));
+        // The first tick completes at once; the certificates were checked
+        // right before the server started, so skip it.
+        interval.tick().await;
+        loop {
+            interval.tick().await;
+            match crate::https::should_renew_certs_check(&config) {
+                Ok(false) => {}
+                Ok(true) => match crate::https::request_cert(&config).await {
+                    Ok(()) => tracing::warn!(
+                        "Renewed the HTTPS certificate; it is on disk in {:?}, but the running server still serves the old one. Restart atomic-server to use the new certificate.",
+                        config.https_path
+                    ),
+                    Err(e) => tracing::error!("HTTPS certificate renewal failed: {}", e),
+                },
+                Err(e) => tracing::error!("Could not check the HTTPS certificate age: {}", e),
+            }
+        }
+    });
+}
+
+const BANNER: &str = r#"
+         __                  _
+  ____ _/ /_____  ____ ___  (_)____      ________  ______   _____  _____
+ / __ `/ __/ __ \/ __ `__ \/ / ___/_____/ ___/ _ \/ ___/ | / / _ \/ ___/
+/ /_/ / /_/ /_/ / / / / / / / /__/_____(__  )  __/ /   | |/ /  __/ /
+\__,_/\__/\____/_/ /_/ /_/_/\___/     /____/\___/_/    |___/\___/_/
+"#;
+
+#[cfg(test)]
+mod connection_budget_tests {
+    use super::http_connections_per_worker;
+
+    #[test]
+    fn reserves_descriptors_across_all_workers() {
+        for (limit, workers) in [(1024, 2), (1024, 8), (256, 2), (4096, 8)] {
+            let per_worker = http_connections_per_worker(limit, workers);
+            let reserve = (limit / 4).max(128);
+            assert!(workers * per_worker <= limit - reserve);
+        }
+        assert_eq!(http_connections_per_worker(1024, 2), 384);
+        assert_eq!(http_connections_per_worker(1024, 8), 96);
+    }
+
+    #[test]
+    fn very_small_and_unlimited_limits_stay_nonzero_and_bounded() {
+        assert_eq!(http_connections_per_worker(64, 1), 1);
+        assert_eq!(http_connections_per_worker(64, 8), 1);
+        assert_eq!(http_connections_per_worker(usize::MAX, 8), 1024);
+        assert_eq!(http_connections_per_worker(1024, 0), 768);
+    }
+
+    /// The budget is only as good as the limit it divides, and a stock soft
+    /// limit of 1024 is what let staging run out of descriptors with HTTP
+    /// still inside its share. Raising first is the whole point, so assert the
+    /// process really is left on its hard limit.
+    #[cfg(unix)]
+    #[test]
+    fn raising_leaves_the_soft_limit_at_the_hard_limit() {
+        super::raise_fd_soft_limit();
+
+        let mut limit = std::mem::MaybeUninit::<libc::rlimit>::uninit();
+        // SAFETY: as in `process_fd_soft_limit`; read only after the check.
+        assert_eq!(
+            unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, limit.as_mut_ptr()) },
+            0,
+            "the descriptor limit should be readable"
+        );
+        let limit = unsafe { limit.assume_init() };
+
+        assert_eq!(
+            limit.rlim_cur, limit.rlim_max,
+            "the soft limit should have been raised to the hard limit"
+        );
+        assert!(
+            super::process_fd_soft_limit().is_some_and(|soft| soft >= 1024),
+            "the raised limit should be readable and no smaller than the stock default"
+        );
+    }
+}

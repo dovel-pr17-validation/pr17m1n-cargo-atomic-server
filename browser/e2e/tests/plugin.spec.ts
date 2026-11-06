@@ -1,0 +1,351 @@
+import test, { expect } from './fixtures';
+import {
+  before,
+  SERVER_URL,
+  currentDialog,
+  fillSearchBox,
+  inDialog,
+  newResource,
+  openDriveSettings,
+  setTitle,
+  openCurrentDrive,
+  testFilePath,
+  waitForSynced,
+} from './test-utils';
+
+const BIRD =
+  'https://atomicdata.dev/01k10mtpp8fkkmsd6tkm9qrqyw/defaultontology/class/bird';
+
+test.describe('Plugins', () => {
+  test.beforeEach(async ({ page }, testInfo) => {
+    // This is a self-hosted plugin test, independent of a developer's SaaS session.
+    // 204 is the supported no-account response; do not contact localhost:3030.
+    await page.route('**/api/me', route => route.fulfill({ status: 204 }));
+    await before({ page }, testInfo);
+  });
+
+  test('install a plugin', async ({ page, context }) => {
+    // Two upload + commit + plugin-install chains, a full bird-creation
+    // form, an iframe-driven picker, plus a reload-and-verify. The test
+    // routinely needs 40-50s on a dev machine even when nothing is wrong.
+    // test.slow() triples the default 60s budget.
+    test.slow();
+
+    // Plugin must be installed BEFORE the folder is created. The plugin uses
+    // `after_commit` + `host.commit` to set the canonical folder name, so it
+    // only fires for commits that land *after* install. Render-time
+    // (`on_resource_get`) transforms can't satisfy this assertion: WS sends
+    // the persisted Loro snapshot (web_sockets.rs:172 KNOWN GAP), so the
+    // browser never sees extender-modified propvals.
+    await openCurrentDrive(page);
+
+    // Plugins live in the Drive settings dialog (its sections start open).
+    const settings = await openDriveSettings(page);
+
+    // Upload a plugin
+    const fileChooserPromise = page.waitForEvent('filechooser');
+    await settings.getByText('Upload Plugin').click();
+    const fileChooser = await fileChooserPromise;
+
+    await fileChooser.setFiles(testFilePath('test-plugin.zip'));
+
+    // The upload publishes a private Release, then the same Installation
+    // review screen the Store uses opens for it.
+    await inDialog(page, async (dialog, closeWith) => {
+      await expect(
+        dialog.getByRole('heading', { name: 'Install plugin' }),
+      ).toBeVisible();
+      await expect(
+        dialog.getByText('ontola/test-plugin', { exact: true }),
+      ).toBeVisible();
+      await expect(dialog.getByText('v1.0.0', { exact: true })).toBeVisible();
+      await expect(dialog.getByText('Storage', { exact: true })).toBeVisible();
+
+      // Check if the install button correctly disables when the config is invalid
+      const installButton = dialog.getByRole('button', { name: 'Install' });
+      await expect(installButton).toBeEnabled();
+
+      await dialog.getByLabel('Config').fill('{"folderPrefix": 5}');
+
+      await expect(installButton).toBeDisabled();
+
+      await dialog.getByLabel('Config').fill('{"folderPrefix": "My"}');
+
+      await expect(installButton).toBeEnabled();
+
+      // Install the plugin
+      await closeWith('Install');
+    });
+
+    // Installing navigates to the new Installation, which the server has
+    // activated by the time the commit round-trips. The page names the
+    // plugin twice: as its heading and inside a link.
+    await expect(
+      page.getByText('ontola/test-plugin', { exact: true }).first(),
+    ).toBeVisible();
+    await expect(page.getByLabel('Status: active')).toBeVisible();
+
+    // Now create the folder. The plugin's `after_commit` fires on the
+    // folder's first commit and emits a follow-up commit setting the
+    // canonical name to "{prefix} Problem".
+    await newResource('folder', page);
+    await setTitle(page, 'Problem');
+
+    await page.reload();
+
+    // The plugin's after_commit fires async, signs a host.commit, and the
+    // rename then propagates over WS. That's a WASM invocation + a second
+    // signed commit + a WS round trip on top of the reload above — under
+    // dagger's CPU-constrained container 15s wasn't enough margin (observed
+    // failures at this exact assertion in CI). test.slow() above triples the
+    // *test's* budget but doesn't touch this call's own explicit timeout, so
+    // widen it directly.
+    await expect(
+      page.getByTestId('editable-title').getByText('My Problem'),
+    ).toBeVisible({ timeout: 30000 });
+
+    // Removed: assertion that changing the plugin config (without a fresh
+    // folder commit) re-renames existing folders. With the after_commit +
+    // host.commit model the plugin only reacts to incoming commits, not to
+    // its own config changes — config-driven re-render needs either
+    // render-time view transforms (incompatible with the WS snapshot path)
+    // or a host-driven reconcile pass on config change.
+
+    // Test the custom view
+    await newResource(BIRD, page);
+
+    await page.getByLabel('name').fill('Duck');
+
+    await page.getByTestId('input-characteristics-add-resource').click();
+
+    {
+      const pickOption = await fillSearchBox(
+        page,
+        'Search for a resource or enter a URL',
+        '',
+      );
+      await pickOption('water');
+    }
+
+    await page.getByRole('button', { name: 'Save' }).click();
+
+    {
+      const frame = page.frameLocator('#custom-view');
+
+      expect(frame).not.toBeNull();
+      if (!frame) throw new Error('Frame not found');
+
+      // Iframe needs to load ui.js, open its own WS, fetch the resource —
+      // give it more headroom than the default 5s actionTimeout.
+      await expect(frame.getByRole('heading', { name: 'Duck' })).toBeVisible({
+        timeout: 20000,
+      });
+      await expect(
+        frame.getByText('This is a custom view for the Bird class.'),
+      ).toBeVisible();
+      await expect(frame.getByText('Water')).toBeVisible();
+
+      await frame
+        .getByRole('button', { name: 'Select favorite folder' })
+        .click();
+
+      await inDialog(page, async (dialog, closeWith) => {
+        await expect(
+          dialog.getByRole('heading', { name: 'Select a folder' }),
+        ).toBeVisible();
+        await expect(
+          dialog.getByText("Pick the bird's favorite folder"),
+        ).toBeVisible();
+        // Type a query so the picker filters to the renamed folder.
+        // KV search is immediate; wait only for the SearchBox debounce.
+        const pickOption = await fillSearchBox(
+          dialog,
+          'Search for a folder',
+          'My',
+        );
+        await expect(
+          dialog.getByTestId('searchbox-results').getByText('My Problem'),
+        ).toBeVisible({ timeout: 5000 });
+        await pickOption('My Problem');
+        await closeWith('Confirm');
+      });
+
+      await expect(frame.getByText('My Problem')).toBeVisible();
+    }
+
+    // Picker consent belongs to this account and concrete installation. Older
+    // plugin-name grants must not be copied into a different account's scope.
+    const grantKeys = await page.evaluate(() =>
+      Object.keys(localStorage).filter(key =>
+        key.startsWith('atomic.plugins.ui.v2.'),
+      ),
+    );
+    expect(grantKeys).toHaveLength(1);
+    const identity = JSON.parse(
+      grantKeys[0].slice('atomic.plugins.ui.v2.'.length),
+    );
+    expect(identity).toHaveLength(4);
+    expect(identity[2]).toMatch(/^(atomic|did:ad):agent:/);
+    expect(identity[3]).toBeTruthy();
+
+    // Check if the view can commit by refreshing and checking the favorite folder.
+    await page.reload();
+
+    {
+      const frame = page.frameLocator('#custom-view');
+
+      expect(frame).not.toBeNull();
+      if (!frame) throw new Error('Frame not found');
+
+      await expect(frame.getByText('My Problem')).toBeVisible({
+        timeout: 15000,
+      });
+    }
+
+    // Navigate back to the plugin
+    await openCurrentDrive(page);
+    const pluginSettings = await openDriveSettings(page);
+    await pluginSettings
+      .getByRole('link', { name: 'ontola/test-plugin' })
+      .click();
+
+    // Keep the mounted resource identity while changing metadata and saving
+    // config. The server's Installation extender fills version, author and
+    // description from the manifest, so these read as plain properties.
+    const saveConfig = page.getByRole('button', { name: 'Save', exact: true });
+    await expect(saveConfig).toBeDisabled();
+    await page
+      .getByLabel('Config', { exact: true })
+      .fill('{"folderPrefix":"Draft"}');
+    await expect(saveConfig).toBeEnabled();
+    await page.getByLabel('Config', { exact: true }).fill('{');
+    await expect(saveConfig).toBeDisabled();
+    await page
+      .getByLabel('Config', { exact: true })
+      .fill('{"folderPrefix":"Draft"}');
+    await expect(saveConfig).toBeEnabled();
+    await page.evaluate(async () => {
+      const subject = new URL(location.href).searchParams.get('subject')!;
+      const resource = window.store.getResourceLoading(subject);
+      await resource.set(
+        'https://atomicdata.dev/properties/version',
+        '1.0.1',
+        false,
+      );
+      await resource.set(
+        'https://atomicdata.dev/properties/pluginAuthor',
+        'Updated author',
+        false,
+      );
+      await resource.set(
+        'https://atomicdata.dev/properties/description',
+        'Updated description',
+        false,
+      );
+    });
+    await expect(page.getByText('v1.0.1', { exact: true })).toBeVisible();
+    await expect(
+      page.getByText('by Updated author', { exact: true }),
+    ).toBeVisible();
+    await expect(page.getByLabel('Plugin Description')).toHaveText(
+      'Updated description',
+    );
+    await expect(page.getByLabel('Config', { exact: true })).toContainText(
+      'Draft',
+    );
+    await saveConfig.click();
+    await expect(saveConfig).toBeDisabled();
+    await waitForSynced(page);
+    await page
+      .getByLabel('Config', { exact: true })
+      .fill('{"folderPrefix": 5}');
+    await expect(saveConfig).toBeDisabled();
+    await page
+      .getByLabel('Config', { exact: true })
+      .fill('{"folderPrefix":"Final"}');
+    await expect(saveConfig).toBeEnabled();
+    await saveConfig.click();
+    await expect(saveConfig).toBeDisabled();
+    await waitForSynced(page);
+
+    await page.evaluate(() => window.store.disconnect());
+    await expect
+      .poll(() =>
+        page.evaluate(() => window.store.getSyncStatus().serverConnected),
+      )
+      .toBe(false);
+    await context.setOffline(true);
+    await page
+      .getByLabel('Config', { exact: true })
+      .fill('{"folderPrefix":"Offline"}');
+    await expect(saveConfig).toBeEnabled();
+    await saveConfig.click();
+    await expect(saveConfig).toBeDisabled();
+    // A queued save must not prevent saving a later offline draft.
+    await page
+      .getByLabel('Config', { exact: true })
+      .fill('{"folderPrefix":"Offline latest"}');
+    await expect(saveConfig).toBeEnabled();
+    await saveConfig.click();
+    await expect(saveConfig).toBeDisabled();
+    await context.setOffline(false);
+    await page.evaluate(() => window.store.reconnect());
+    await waitForSynced(page);
+    await page.reload();
+    await expect(page.getByLabel('Config', { exact: true })).toContainText(
+      'Offline latest',
+    );
+    await expect(saveConfig).toBeDisabled();
+
+    // Uninstall the plugin
+    await page.getByRole('button', { name: 'Uninstall' }).click();
+
+    await inDialog(page, async (dialog, closeWith) => {
+      await expect(
+        dialog.getByRole('heading', { name: 'Uninstall plugin' }),
+      ).toBeVisible();
+      await closeWith('Uninstall');
+    });
+
+    // The installation page is gone once the uninstall navigates away.
+    await expect(page.getByRole('button', { name: 'Uninstall' })).toBeHidden();
+
+    // After uninstall the plugin resource is destroyed, so reloading on its
+    // URL would 404. Navigate to the drive page first.
+    await openCurrentDrive(page);
+
+    // The folder keeps its prefixed name after uninstall: with the
+    // after_commit + host.commit model the rename was a real commit, so it
+    // persists. It is a row in the drive page's Resources list.
+    await expect(
+      page.getByRole('main').getByRole('link', { name: 'My Problem' }).first(),
+    ).toBeVisible({ timeout: 30000 });
+
+    // The Plugins setting no longer lists the plugin.
+    const settingsAfter = await openDriveSettings(page);
+    await expect(settingsAfter.getByText('No plugins installed')).toBeVisible();
+    await page.keyboard.press('Escape');
+    await expect(currentDialog(page)).toBeHidden();
+
+    // Check if the custom view is gone.
+    await page
+      .getByTestId('sidebar')
+      .getByRole('button', { name: 'Duck' })
+      .click();
+    await expect(page.locator('#custom-view')).toHaveCount(0);
+    await expect(page.getByTestId('editable-title')).toHaveText('Duck');
+  });
+});
+
+// The bootstrap accepts asset contents from its parent, so the server must
+// enforce an opaque origin even when a caller omits the iframe sandbox.
+test('plugin bootstrap enforces its own sandbox', async ({ page }) => {
+  const response = await page.goto(
+    `${SERVER_URL}/plugin-ui?drive=unused&plugin=test.shell&format=html`,
+  );
+  expect(response?.headers()['content-security-policy']).toMatch(
+    /sandbox[^;]*;/,
+  );
+  expect(await page.evaluate(() => window.origin)).toBe('null');
+  expect(await page.locator('script[src]').count()).toBe(0);
+});

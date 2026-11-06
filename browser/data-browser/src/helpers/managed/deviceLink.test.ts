@@ -1,0 +1,336 @@
+import { createHash } from 'node:crypto';
+import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
+import {
+  approvalUrl,
+  awaitDeviceLink,
+  canHoldProviderCookie,
+  isDeviceLinked,
+  newReturnVerifier,
+  parseAccountReturn,
+  pollDeviceLink,
+  redeemDeviceLink,
+  requestDeviceLink,
+  unlinkDevice,
+  type LinkRequest,
+} from './deviceLink';
+import {
+  getManagedApiBase,
+  getManagedDeviceToken,
+  getRememberedManagedPortalUrl,
+  setManagedDeviceToken,
+} from './api';
+
+// The case that matters here is the one with no origin to fall back on. A
+// browser on the provider's own site resolves `/api` same-origin and never
+// depends on what linking remembered; the desktop and Android apps, on
+// `tauri://localhost`, depend on it entirely.
+const inTauri = { value: false };
+vi.mock('../tauri', () => ({ isRunningInTauri: () => inTauri.value }));
+
+const PORTAL = 'https://portal.example';
+
+// The default vitest environment here is `node`, so there is no localStorage —
+// the same stand-in `knownPeers.test.ts` uses. Without it every token read
+// returns null through the module's own storage-disabled fallback, which would
+// make these tests pass for the wrong reason.
+function installLocalStorage(): Map<string, string> {
+  const store = new Map<string, string>();
+
+  globalThis.localStorage = {
+    getItem: (key: string) => store.get(key) ?? null,
+    setItem: (key: string, value: string) => void store.set(key, value),
+    removeItem: (key: string) => void store.delete(key),
+    clear: () => store.clear(),
+    key: (index: number) => [...store.keys()][index] ?? null,
+    get length() {
+      return store.size;
+    },
+  } as Storage;
+
+  return store;
+}
+
+const request: LinkRequest = {
+  device_code: 'dc-long-secret',
+  user_code: 'K3F9-2XQP',
+  expires_in: 600,
+  interval: 0,
+};
+
+beforeEach(() => {
+  installLocalStorage();
+  setManagedDeviceToken(null);
+  vi.restoreAllMocks();
+});
+
+afterEach(() => {
+  setManagedDeviceToken(null);
+  inTauri.value = false;
+});
+
+const jsonResponse = (body: unknown, status = 200) =>
+  ({
+    ok: status >= 200 && status < 300,
+    status,
+    json: async () => body,
+  }) as Response;
+
+describe('requestDeviceLink', () => {
+  it('names this device, so the approver is not signing a blank cheque', async () => {
+    const fetchMock = vi
+      .spyOn(globalThis, 'fetch')
+      .mockResolvedValue(jsonResponse(request));
+
+    await requestDeviceLink(PORTAL, 'Joep’s Pixel');
+
+    const [url, init] = fetchMock.mock.calls[0];
+    expect(String(url)).toBe(`${PORTAL}/api/device-link`);
+    expect(init?.credentials).toBe('omit');
+    expect(JSON.parse(String((init as RequestInit).body))).toEqual({
+      device_name: 'Joep’s Pixel',
+    });
+  });
+
+  /** A throttled provider must not read as an unreachable one. */
+  it('distinguishes rate limiting from an unreachable provider', async () => {
+    vi.spyOn(globalThis, 'fetch').mockResolvedValue(jsonResponse({}, 429));
+    await expect(requestDeviceLink(PORTAL)).rejects.toThrow(/Too many/);
+
+    vi.spyOn(globalThis, 'fetch').mockResolvedValue(jsonResponse({}, 500));
+    await expect(requestDeviceLink(PORTAL)).rejects.toThrow(
+      /Check the address/,
+    );
+  });
+});
+
+describe('pollDeviceLink', () => {
+  it('reads pending and approved', async () => {
+    const fetch = vi
+      .spyOn(globalThis, 'fetch')
+      .mockResolvedValue(jsonResponse({ state: 'pending' }));
+    expect(await pollDeviceLink(PORTAL, 'dc')).toEqual({ state: 'pending' });
+    expect(fetch.mock.calls[0][1]?.credentials).toBe('omit');
+
+    vi.spyOn(globalThis, 'fetch').mockResolvedValue(
+      jsonResponse({ state: 'approved', token: 'sess' }),
+    );
+    expect(await pollDeviceLink(PORTAL, 'dc')).toEqual({
+      state: 'approved',
+      token: 'sess',
+    });
+  });
+
+  /**
+   * The provider answers 404 for unknown, expired and already-collected alike,
+   * on purpose. The client must not invent a distinction it was denied.
+   */
+  it('treats a 404 as "start again" rather than an error', async () => {
+    vi.spyOn(globalThis, 'fetch').mockResolvedValue(jsonResponse(null, 404));
+    expect(await pollDeviceLink(PORTAL, 'dc')).toEqual({ state: 'expired' });
+  });
+});
+
+describe('awaitDeviceLink', () => {
+  it('keeps the session once approved', async () => {
+    vi.spyOn(globalThis, 'fetch')
+      .mockResolvedValueOnce(jsonResponse({ state: 'pending' }))
+      .mockResolvedValueOnce(
+        jsonResponse({ state: 'approved', token: 'sess' }),
+      );
+
+    expect(await awaitDeviceLink(PORTAL, request)).toBe('linked');
+    expect(getManagedDeviceToken()).toBe('sess');
+    expect(isDeviceLinked()).toBe(true);
+  });
+
+  /**
+   * A session is useless without knowing where to spend it. The desktop and
+   * Android apps learn their control plane from nowhere else: `tauri://localhost`
+   * has no same-origin `/api`, and their embedded node is not managed and names
+   * no portal. Linking once stored this under a key `getManagedApiBase()` did
+   * not read, so every managed call afterwards resolved against
+   * `tauri.localhost/api` — the link looked fine and the vault simply never
+   * appeared.
+   */
+  it('remembers the provider where the API base will look for it', async () => {
+    vi.spyOn(globalThis, 'fetch').mockResolvedValue(
+      jsonResponse({ state: 'approved', token: 'sess' }),
+    );
+
+    inTauri.value = true;
+
+    try {
+      await awaitDeviceLink(PORTAL, request);
+
+      expect(getRememberedManagedPortalUrl()).toBe(PORTAL);
+      expect(getManagedApiBase()).toBe(`${PORTAL}/api`);
+    } finally {
+      inTauri.value = false;
+    }
+  });
+
+  it('gives up when the provider says the code is gone', async () => {
+    vi.spyOn(globalThis, 'fetch').mockResolvedValue(jsonResponse(null, 404));
+
+    expect(await awaitDeviceLink(PORTAL, request)).toBe('expired');
+    expect(getManagedDeviceToken()).toBeNull();
+  });
+
+  /**
+   * A user who navigates away must not leave a request polling for its full
+   * ten minutes.
+   */
+  it('stops when aborted', async () => {
+    const fetchMock = vi
+      .spyOn(globalThis, 'fetch')
+      .mockResolvedValue(jsonResponse({ state: 'pending' }));
+    const controller = new AbortController();
+    controller.abort();
+
+    expect(
+      await awaitDeviceLink(PORTAL, request, { signal: controller.signal }),
+    ).toBe('expired');
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+
+  /** Nothing is stored until a provider actually says yes. */
+  it('stores nothing while pending', async () => {
+    vi.spyOn(globalThis, 'fetch').mockResolvedValue(
+      jsonResponse({ state: 'pending' }),
+    );
+
+    await awaitDeviceLink(PORTAL, { ...request, expires_in: 0 });
+    expect(getManagedDeviceToken()).toBeNull();
+  });
+});
+
+describe('unlinkDevice', () => {
+  it('forgets the session', () => {
+    setManagedDeviceToken('sess');
+    expect(isDeviceLinked()).toBe(true);
+
+    unlinkDevice();
+    expect(isDeviceLinked()).toBe(false);
+    expect(getManagedDeviceToken()).toBeNull();
+  });
+});
+
+describe('being sent back to the app', () => {
+  it('sends the provider the hash of a verifier only this app keeps', () => {
+    const { verifier, challenge } = newReturnVerifier();
+
+    expect(verifier).toMatch(/^[A-Za-z0-9_-]{43}$/);
+    expect(challenge).toBe(
+      createHash('sha256').update(verifier).digest('base64url'),
+    );
+    expect(newReturnVerifier().verifier).not.toBe(verifier);
+  });
+
+  it('reads the code and handoff from the link, and nothing else', () => {
+    expect(
+      parseAccountReturn('atomic://account-return?code=K3F9-2XQP&handoff=H1'),
+    ).toEqual({ code: 'K3F9-2XQP', handoff: 'H1' });
+    expect(parseAccountReturn('atomic://account-return?code=K3F9-2XQP')).toBe(
+      null,
+    );
+    expect(parseAccountReturn('atomic://open?subject=x')).toBe(null);
+  });
+
+  it('keeps the session it redeems, for the provider that issued it', async () => {
+    const fetchMock = vi
+      .spyOn(globalThis, 'fetch')
+      .mockResolvedValue(jsonResponse({ state: 'approved', token: 'tok' }));
+
+    await expect(
+      redeemDeviceLink(PORTAL, 'dc-long-secret', 'H1', 'the-verifier'),
+    ).resolves.toBe(true);
+
+    const [url, init] = fetchMock.mock.calls[0];
+    expect(String(url)).toBe(`${PORTAL}/api/device-link/dc-long-secret/redeem`);
+    expect(init?.credentials).toBe('omit');
+    expect(JSON.parse(String((init as RequestInit).body))).toEqual({
+      handoff: 'H1',
+      verifier: 'the-verifier',
+    });
+    expect(getManagedDeviceToken()).toBe('tok');
+  });
+
+  it('keeps nothing for a handoff that is not this request’s', async () => {
+    vi.spyOn(globalThis, 'fetch').mockResolvedValue(jsonResponse({}, 404));
+
+    await expect(
+      redeemDeviceLink(PORTAL, 'dc-long-secret', 'H1', 'v'),
+    ).resolves.toBe(false);
+    expect(getManagedDeviceToken()).toBeNull();
+  });
+});
+
+describe('approvalUrl', () => {
+  it('points at the provider’s own page, trailing slash or not', () => {
+    expect(approvalUrl(PORTAL, 'K3F9-2XQP')).toBe(
+      'https://portal.example/link?code=K3F9-2XQP',
+    );
+    expect(approvalUrl(`${PORTAL}/`, 'K3F9-2XQP')).toBe(
+      'https://portal.example/link?code=K3F9-2XQP',
+    );
+  });
+});
+
+describe('canHoldProviderCookie', () => {
+  const saved = globalThis.window;
+
+  function at(href: string) {
+    globalThis.window = { location: new URL(href) } as unknown as Window &
+      typeof globalThis;
+  }
+
+  afterEach(() => {
+    globalThis.window = saved;
+  });
+
+  it('is true on the portal itself and on a subdomain of it', () => {
+    at('https://portal.example/app');
+    expect(canHoldProviderCookie(PORTAL)).toBe(true);
+
+    at('https://app.portal.example/app');
+    expect(canHoldProviderCookie(PORTAL)).toBe(true);
+  });
+
+  it('is true across ports in local development (cookies ignore the port)', () => {
+    at('http://localhost:6747/app');
+    expect(canHoldProviderCookie('http://localhost:49237')).toBe(true);
+  });
+
+  it('is false in a native development WebView even when its URL matches the portal host', () => {
+    at('http://localhost:6747/app');
+    inTauri.value = true;
+
+    expect(canHoldProviderCookie('http://localhost:49237')).toBe(false);
+    inTauri.value = false;
+  });
+
+  it('is false for the desktop and Android apps on tauri://localhost', () => {
+    at('tauri://localhost/app');
+    expect(canHoldProviderCookie(PORTAL)).toBe(false);
+  });
+
+  it('is false on a different site, and a look-alike is a different site', () => {
+    at('https://my-own-server.example/app');
+    expect(canHoldProviderCookie(PORTAL)).toBe(false);
+
+    at('https://notportal.example/app');
+    expect(canHoldProviderCookie(PORTAL)).toBe(false);
+  });
+
+  it('is false across schemes even when the hostname matches', () => {
+    at('http://app.portal.example/app');
+    expect(canHoldProviderCookie(PORTAL)).toBe(false);
+    at('https://portal.example/app');
+    expect(canHoldProviderCookie('http://portal.example')).toBe(false);
+  });
+
+  it('is false with no portal to hold a cookie for', () => {
+    at('https://portal.example/app');
+    expect(canHoldProviderCookie(null)).toBe(false);
+  });
+});

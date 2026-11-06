@@ -1,0 +1,201 @@
+//! Setting and reading what makes a plugin run when the data changes.
+//!
+//! The same shape as `/plugin-schedule`, and for the same reason: host state
+//! keyed by `(drive, plugin)`, because a plugin's schema is created per drive
+//! and a Rust listener cannot resolve its property subjects.
+
+use actix_web::{web, HttpResponse};
+use atomic_lib::{
+    db::{
+        plugin_trigger::{PluginTrigger, PluginTriggerInfo, PluginTriggerKey},
+        PropVal, QueryFilter,
+    },
+    Value,
+};
+
+use crate::{
+    appstate::AppState,
+    errors::{AtomicServerError, AtomicServerResult},
+    helpers::authorize_plugin_write,
+};
+
+#[derive(serde::Deserialize, Debug)]
+#[serde(rename_all = "camelCase")]
+pub struct FilterBody {
+    pub property: Option<String>,
+    pub value: Option<String>,
+}
+
+#[derive(serde::Deserialize, Debug)]
+#[serde(rename_all = "camelCase")]
+pub struct SetTriggerBody {
+    pub drive: String,
+    pub plugin: String,
+    /// The ANDed constraints a resource must match. `null` removes the trigger.
+    pub filters: Option<Vec<FilterBody>>,
+    #[serde(default)]
+    pub on_enter: bool,
+    #[serde(default)]
+    pub on_leave: bool,
+    /// Write without review. Only accepted with a reviewed run behind it.
+    #[serde(default)]
+    pub auto_apply: bool,
+}
+
+#[derive(serde::Deserialize, Debug)]
+#[serde(rename_all = "camelCase")]
+pub struct TriggerQuery {
+    pub drive: String,
+    pub plugin: String,
+}
+
+#[tracing::instrument(skip(appstate, raw, req))]
+pub async fn handle_set_trigger(
+    appstate: web::Data<AppState>,
+    raw: web::Bytes,
+    req: actix_web::HttpRequest,
+    context: crate::context::RequestContext,
+) -> AtomicServerResult<HttpResponse> {
+    let body: SetTriggerBody = crate::helpers::parse_json(&raw)?;
+    let agent = authorize_plugin_write(&appstate, &req, &context, &raw, &body.plugin).await?;
+    let key = PluginTriggerKey::new(&body.drive, &body.plugin);
+
+    let Some(filters) = &body.filters else {
+        appstate.store.delete_plugin_trigger(&key)?;
+
+        return Ok(HttpResponse::Ok().json(read(&appstate, &key)?));
+    };
+
+    if filters.is_empty() {
+        // An unconstrained query matches the whole drive, which would run the
+        // plugin on every write anywhere. Refused rather than allowed with a
+        // warning: nobody means this.
+        return Err(AtomicServerError::bad_request(
+            "A trigger needs at least one condition, or it would run on every change to the drive",
+        ));
+    }
+
+    crate::handlers::plugin_schedule::refuse_if_unattended_is_impossible(
+        &appstate,
+        &body.drive,
+        &body.plugin,
+    )
+    .await?;
+
+    let query = QueryFilter {
+        filters: filters
+            .iter()
+            .map(|filter| PropVal {
+                property: filter.property.clone(),
+                value: filter.value.as_ref().map(|v| Value::String(v.clone())),
+                ..Default::default()
+            })
+            .collect(),
+        sort_by: None,
+        drive: body.drive.as_str().into(),
+    };
+
+    let mut trigger = PluginTrigger::new(query, body.on_enter, body.on_leave)
+        .map_err(|e| AtomicServerError::bad_request(e.to_string()))?;
+
+    if body.auto_apply {
+        // The same precondition a schedule's grant has, checked the same way.
+        trigger.auto_apply = Some(
+            crate::handlers::plugin_schedule::build_auto_apply_grant(
+                &appstate,
+                &agent,
+                &body.drive,
+                &body.plugin,
+            )
+            .await?,
+        );
+    }
+
+    // Changing automatic execution must not silently discard a queued
+    // proposal. A reviewed manual run is the operation that resolves it.
+    if let Some(previous) = appstate.store.get_plugin_trigger(&key)? {
+        if atomic_lib::db::query_id(&previous.query)? == atomic_lib::db::query_id(&trigger.query)? {
+            trigger.pending_verdict = previous.pending_verdict;
+        }
+    }
+    trigger.run_as = Some(agent.to_string());
+    appstate.store.set_plugin_trigger(&key, &trigger)?;
+
+    Ok(HttpResponse::Ok().json(read(&appstate, &key)?))
+}
+
+#[tracing::instrument(skip(appstate, req))]
+pub async fn handle_get_trigger(
+    appstate: web::Data<AppState>,
+    query: web::Query<TriggerQuery>,
+    req: actix_web::HttpRequest,
+    context: crate::context::RequestContext,
+) -> AtomicServerResult<HttpResponse> {
+    authorize_plugin_write(&appstate, &req, &context, &[], &query.plugin).await?;
+
+    Ok(HttpResponse::Ok().json(read(
+        &appstate,
+        &PluginTriggerKey::new(&query.drive, &query.plugin),
+    )?))
+}
+
+fn read(
+    appstate: &AppState,
+    key: &PluginTriggerKey,
+) -> AtomicServerResult<Option<serde_json::Value>> {
+    let Some(trigger) = appstate.store.get_plugin_trigger(key)? else {
+        return Ok(None);
+    };
+    let mut info = PluginTriggerInfo::from(&trigger);
+    info.queued_events = appstate.store.pending_trigger_events(key, &trigger)?;
+    Ok(Some(trigger_response(&info)))
+}
+
+/// HTTP filters use the same string values accepted by FilterBody, not the
+/// database's tagged Value serialization. Clients can round-trip them unchanged.
+fn trigger_response(info: &PluginTriggerInfo) -> serde_json::Value {
+    let mut response = serde_json::json!(info);
+    response["query"]["filters"] = serde_json::json!(info.query.filters.iter().map(|filter| {
+        serde_json::json!({ "property": filter.property, "value": filter.value.as_ref().map(ToString::to_string) })
+    }).collect::<Vec<_>>());
+    response
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn response_filters_round_trip_into_updates() {
+        let info = PluginTriggerInfo {
+            queued_events: 2,
+            query: QueryFilter {
+                filters: vec![
+                    PropVal {
+                        property: Some("https://example.org/parent".into()),
+                        value: Some(Value::String("did:ad:fixture".into())),
+                        ..Default::default()
+                    },
+                    PropVal {
+                        property: Some("https://example.org/name".into()),
+                        ..Default::default()
+                    },
+                ],
+                drive: "did:ad:drive".into(),
+                sort_by: None,
+            },
+            on_enter: true,
+            on_leave: false,
+            auto_apply: None,
+            last_error: None,
+            pending_verdict: Some("pending".into()),
+        };
+        let response = trigger_response(&info);
+        let filters: Vec<FilterBody> =
+            serde_json::from_value(response["query"]["filters"].clone()).unwrap();
+        assert_eq!(filters[0].value.as_deref(), Some("did:ad:fixture"));
+        assert_eq!(filters[1].value, None);
+        assert_eq!(response["queuedEvents"], 2);
+        assert_eq!(response["pendingVerdict"], "pending");
+    }
+}

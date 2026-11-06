@@ -1,0 +1,499 @@
+import { lazy, Suspense, useCallback, useEffect, useState } from 'react';
+import {
+  ai,
+  Client,
+  core,
+  dataBrowser,
+  useArray,
+  useDrive,
+  useString,
+} from '@tomic/react';
+import { DIVIDER, DropdownMenu, isItem, DropdownItem } from '../Dropdown';
+import { AutoOpenTrigger } from '../Dropdown/AutoOpenTrigger';
+import { DropdownTriggerComponent } from '../Dropdown/DropdownTrigger';
+import { buildDefaultTrigger } from '../Dropdown/DefaultTrigger';
+import {
+  FaArrowUpRightFromSquare,
+  FaEllipsisVertical,
+  FaFlag,
+  FaWpforms,
+} from 'react-icons/fa6';
+import {
+  ConfirmationDialog,
+  ConfirmationDialogTheme,
+} from '../ConfirmationDialog';
+import { ResourceCodeUsageDialog } from '../../views/CodeUsage/ResourceCodeUsageDialog';
+import { addIf } from '../../helpers/addIf';
+import { resourceActions } from '../../actions/resourceActions';
+import { useAppMenuItems } from '../../actions/appMenuItems';
+import { useActionContext } from '../../actions/useActionContext';
+import { runAction } from '../../actions/runAction';
+import type { ActionDefinition } from '../../actions/types';
+import { usePluginClass } from '@chunks/PluginRuns/useDriveClass';
+import { useCustomContextItemsContext } from './CustomContextItemsContext';
+import { MoveResourceDialog } from '../MoveResourceDialog';
+import { CoverPickerDialog, IconPickerDialog } from '../ResourceDecorations';
+import { ResourceInline } from '../../views/ResourceInline';
+import { ResourceUsage } from '../ResourceUsage';
+import { getDeleteDialog } from './deleteDialogRegistry';
+import { useAfterResourceDelete } from '../../hooks/useAfterResourceDelete';
+import { useExternalApps } from '../../hooks/useExternalApps';
+import { appsForResource } from '../../helpers/driveApps';
+
+const CreateTableFormDialog = lazy(() =>
+  import('../../chunks/TablePage/CreateTableFormDialog').then(module => ({
+    default: module.CreateTableFormDialog,
+  })),
+);
+
+const RunPluginDialog = lazy(() =>
+  import('@chunks/PluginRuns/RunPluginDialog').then(m => ({
+    default: m.RunPluginDialog,
+  })),
+);
+const ReportAIChatDialog = lazy(() => import('@chunks/AI/ReportAIChatDialog'));
+
+export {
+  CustomContextItemsProvider,
+  useCustomContextItems,
+} from './CustomContextItemsContext';
+
+export { ResourceContextMenuProvider } from './ResourceContextMenuProvider';
+export { ResourceContextMenuHost } from './ResourceContextMenuHost';
+export { useResourceContextMenu } from './ResourceContextMenuContext';
+
+export { DIVIDER, type DropdownItem } from '../Dropdown';
+
+/** Ids of the actions in the registry (`actions/resourceActions.tsx`). */
+export const ContextMenuOptions = {
+  View: 'view',
+  Data: 'data',
+  Edit: 'edit',
+  Scope: 'scope',
+  Share: 'share',
+  Tags: 'tags',
+  Delete: 'delete',
+  Restore: 'restore',
+  History: 'history',
+  Import: 'import',
+  UseInCode: 'useInCode',
+  NewChild: 'newChild',
+  Export: 'export',
+  Open: 'open',
+  AddToChat: 'addToChat',
+  Comment: 'comment',
+  ReportAIChat: 'reportAIChat',
+  Favorite: 'favorite',
+  Parent: 'parent',
+  EditAsFork: 'editAsFork',
+  MergeFork: 'mergeFork',
+  OpenOriginal: 'openOriginal',
+  SetEmoji: 'setEmoji',
+  SetCover: 'setCover',
+  CreateTableForm: 'createTableForm',
+  Reload: 'reload',
+  Move: 'move',
+} as const;
+
+export type ContextMenuOptionsUnion =
+  (typeof ContextMenuOptions)[keyof typeof ContextMenuOptions];
+
+export interface ResourceContextMenuProps {
+  subject: string;
+  // If given only these options will appear in the list.
+  showOnly?: ContextMenuOptionsUnion[];
+  trigger?: DropdownTriggerComponent;
+  simple?: boolean;
+  /** If it's the primary menu in the navbar. Used for triggering keyboard shortcut */
+  isMainMenu?: boolean;
+  bindActive?: (active: boolean) => void;
+  /** Callback that is called after the resource was deleted */
+  onAfterDelete?: () => void;
+  title?: string;
+  external?: boolean;
+  /**
+   * When set, opens the menu at this viewport point (a right-click context
+   * menu) instead of anchoring to a trigger. Defaults the trigger to an
+   * invisible auto-opening one unless an explicit `trigger` is given.
+   */
+  anchorPoint?: { x: number; y: number };
+  /**
+   * Render a filter input at the top so the user can type to narrow the
+   * actions and run one with Enter. Enabled by default for every menu,
+   * including sidebar buttons and embedded menus.
+   */
+  searchable?: boolean;
+}
+
+/**
+ * Dropdown menu that opens a bunch of actions for some resource. Items come
+ * from the central action registry. The main menu (navbar kebab / cmd+m) and
+ * the right-click menu on any resource (sidebar link, table cell, kanban
+ * card) share the same searchable list: right-click, type, Enter.
+ */
+export function ResourceContextMenu({
+  subject,
+  showOnly,
+  trigger,
+  simple,
+  isMainMenu,
+  title,
+  external,
+  bindActive,
+  onAfterDelete,
+  anchorPoint,
+  searchable = true,
+}: ResourceContextMenuProps) {
+  const [confirmingAction, setConfirmingAction] = useState<ActionDefinition>();
+  const [showCustomDeleteDialog, setShowCustomDeleteDialog] = useState(false);
+  const [showCodeUsageDialog, setShowCodeUsageDialog] = useState(false);
+  const [showCreateTableForm, setShowCreateTableForm] = useState(false);
+  const [menuOpen, setMenuOpen] = useState(false);
+  const [shiftHeld, setShiftHeld] = useState(false);
+  const openCodeUsageDialog = useCallback(
+    () => setShowCodeUsageDialog(true),
+    [],
+  );
+  // undefined = never opened (dialog not mounted), boolean = mounted.
+  const [emojiPickerOpen, setEmojiPickerOpen] = useState<boolean>();
+  const [coverPickerOpen, setCoverPickerOpen] = useState<boolean>();
+  const [moveOpen, setMoveOpen] = useState<boolean>();
+  const [pluginRunOpen, setPluginRunOpen] = useState<boolean>();
+  const [reportChatOpen, setReportChatOpen] = useState<boolean>();
+  const openMoveDialog = useCallback(() => setMoveOpen(true), []);
+  const openPluginRun = useCallback(() => setPluginRunOpen(true), []);
+  const [currentDrive] = useDrive();
+  const pluginClass = usePluginClass(currentDrive);
+  const openEmojiPicker = useCallback(() => setEmojiPickerOpen(true), []);
+  const openCoverPicker = useCallback(() => setCoverPickerOpen(true), []);
+  const ctx = useActionContext(subject, {
+    external,
+    onAfterDelete,
+    showCodeUsageDialog: openCodeUsageDialog,
+    openEmojiPicker,
+    openCoverPicker,
+    openMoveDialog,
+    openPluginRun,
+    pluginClass,
+  });
+  const [dataClassSubject] = useString(ctx.resource, core.properties.classtype);
+  const [resourceClasses] = useArray(ctx.resource, core.properties.isA);
+  const { items: customItems } = useCustomContextItemsContext();
+  const CustomDeleteDialog = getDeleteDialog(ctx.resource.getClasses()[0]);
+  const afterDelete = useAfterResourceDelete(subject, onAfterDelete);
+  const appMenu = useAppMenuItems();
+  const externalApps = useExternalApps(currentDrive);
+  // Try to not have a useResource hook in here, as that will lead to many costly fetches when the user enters a new subject
+
+  const handleBindActive = useCallback(
+    (active: boolean) => {
+      setMenuOpen(active);
+
+      if (!active) {
+        setShiftHeld(false);
+      }
+
+      bindActive?.(active);
+    },
+    [bindActive],
+  );
+
+  useEffect(() => {
+    if (!menuOpen) {
+      return;
+    }
+
+    const updateShiftFromEvent = (e: KeyboardEvent | MouseEvent) => {
+      setShiftHeld(e.shiftKey);
+    };
+
+    document.addEventListener('keydown', updateShiftFromEvent);
+    document.addEventListener('keyup', updateShiftFromEvent);
+    document.addEventListener('mousemove', updateShiftFromEvent);
+
+    return () => {
+      document.removeEventListener('keydown', updateShiftFromEvent);
+      document.removeEventListener('keyup', updateShiftFromEvent);
+      document.removeEventListener('mousemove', updateShiftFromEvent);
+    };
+  }, [menuOpen]);
+
+  if (subject === undefined) {
+    return null;
+  }
+
+  if (!Client.isValidSubject(subject)) {
+    return null;
+  }
+
+  // A menu that names Delete explicitly (the ontology cards) means the real
+  // delete of an ontology member, not a move to the Trash.
+  const permanentDeleteOnly = !!showOnly?.includes(ContextMenuOptions.Delete);
+  const availableActions = resourceActions.filter(action => {
+    if (simple && action.section === 'view') {
+      return false;
+    }
+
+    if (permanentDeleteOnly && action.id === ContextMenuOptions.Delete) {
+      return ctx.canWrite;
+    }
+
+    return action.available?.(ctx) ?? true;
+  });
+
+  const items: DropdownItem[] = [];
+  // Reload sits with "Restart app" at the very bottom of the menu.
+  const maintenanceItems: DropdownItem[] = [];
+  let previousSection: string | undefined;
+
+  for (const action of availableActions.filter(
+    a => a.section !== 'maintenance',
+  )) {
+    if (previousSection !== undefined && action.section !== previousSection) {
+      items.push(DIVIDER);
+    }
+
+    previousSection = action.section;
+
+    // Classes with their own delete dialog (e.g. Forms, which can also delete
+    // a results table) must always go through it — shift-to-skip and the
+    // generic confirmation are only safe for the non-cascading delete.
+    const usesCustomDeleteDialog =
+      action.id === ContextMenuOptions.Delete && CustomDeleteDialog;
+
+    items.push({
+      id: action.id,
+      label:
+        shiftHeld &&
+        action.danger &&
+        action.dangerLabel &&
+        !usesCustomDeleteDialog
+          ? action.dangerLabel(ctx)
+          : action.label(ctx),
+      helper: action.helper(ctx),
+      icon: action.icon?.(ctx),
+      shortcut: simple ? undefined : action.shortcut,
+      disabled: action.disabled?.(ctx),
+      keywords: action.keywords,
+      searchOnly:
+        typeof action.searchOnly === 'function'
+          ? action.searchOnly(ctx)
+          : action.searchOnly,
+      onClick: () => {
+        // Shift skips the confirmation dialog for danger actions.
+        if (usesCustomDeleteDialog) {
+          setShowCustomDeleteDialog(true);
+        } else if (action.danger && action.confirmation && !shiftHeld) {
+          setConfirmingAction(action);
+        } else {
+          runAction(action, ctx);
+        }
+      },
+    });
+  }
+
+  for (const action of availableActions.filter(
+    a => a.section === 'maintenance',
+  )) {
+    maintenanceItems.push({
+      id: action.id,
+      label: action.label(ctx),
+      helper: action.helper(ctx),
+      icon: action.icon?.(ctx),
+      keywords: action.keywords,
+      searchOnly: true,
+      onClick: () => runAction(action, ctx),
+    });
+  }
+
+  // Page-specific actions lead; the menu owns their boundary with generic actions.
+  // Older callers include a leading/trailing divider, which must not leak here.
+  const pageItems = subject === ctx.currentSubject ? [...customItems] : [];
+  while (pageItems[0] === DIVIDER) pageItems.shift();
+  while (pageItems.at(-1) === DIVIDER) pageItems.pop();
+
+  if (
+    ctx.canWrite &&
+    resourceClasses.includes(dataBrowser.classes.table) &&
+    dataClassSubject
+  ) {
+    items.push({
+      id: ContextMenuOptions.CreateTableForm,
+      label: 'Create form from this table',
+      icon: <FaWpforms />,
+      onClick: () => setShowCreateTableForm(true),
+    });
+  }
+
+  // Native apps registered in this drive that handle the resource's class.
+  for (const { app, url } of appsForResource(
+    externalApps,
+    ctx.resource.getClasses(),
+    subject,
+  )) {
+    items.push({
+      id: `open-in-${app.subject}`,
+      label: `Open in ${app.name}`,
+      icon: <FaArrowUpRightFromSquare />,
+      onClick: () => window.open(url, '_blank', 'noopener,noreferrer'),
+    });
+  }
+
+  // Add custom items from context (if any) before filtering
+  const allItems = [
+    ...pageItems,
+    ...addIf(pageItems.length > 0 && items.length > 0, DIVIDER),
+    ...items,
+    ...addIf(ctx.resource.getClasses().includes(ai.classes.aiChat), DIVIDER),
+    ...addIf(ctx.resource.getClasses().includes(ai.classes.aiChat), {
+      id: ContextMenuOptions.ReportAIChat,
+      label: 'Report AI chat',
+      helper:
+        'Review the chat transcript before sharing it with the Atomic team',
+      icon: <FaFlag />,
+      onClick: () => setReportChatOpen(true),
+    }),
+  ];
+
+  // The navbar's More menu ends with places in the app (settings, drives,
+  // feedback), below this page's own actions, then the maintenance group.
+  if (isMainMenu && !showOnly) {
+    allItems.push(
+      DIVIDER,
+      ...appMenu.find,
+      DIVIDER,
+      ...maintenanceItems,
+      ...appMenu.maintenance,
+    );
+  } else {
+    allItems.push(
+      ...addIf(maintenanceItems.length > 0, DIVIDER),
+      ...maintenanceItems,
+    );
+  }
+
+  const filteredItems = showOnly
+    ? allItems.filter(
+        item =>
+          !isItem(item) ||
+          showOnly.includes(item.id as ContextMenuOptionsUnion),
+      )
+    : allItems;
+
+  const triggerComp =
+    trigger ??
+    (anchorPoint
+      ? AutoOpenTrigger
+      : buildDefaultTrigger(
+          <FaEllipsisVertical />,
+          title ?? `Open ${ctx.resource.title} menu`,
+        ));
+
+  const confirmation = confirmingAction?.confirmation;
+
+  return (
+    <>
+      <DropdownMenu
+        items={filteredItems}
+        Trigger={triggerComp}
+        isMainMenu={isMainMenu}
+        searchable={searchable}
+        bindActive={handleBindActive}
+        anchorPoint={anchorPoint}
+      />
+      {showCreateTableForm && dataClassSubject && (
+        <Suspense fallback={null}>
+          <CreateTableFormDialog
+            key={subject}
+            table={ctx.resource}
+            dataClassSubject={dataClassSubject}
+            onClose={() => setShowCreateTableForm(false)}
+          />
+        </Suspense>
+      )}
+      <ConfirmationDialog
+        title={confirmation?.title(ctx) ?? ''}
+        show={confirmingAction !== undefined}
+        bindShow={show => {
+          if (!show) {
+            setConfirmingAction(undefined);
+          }
+        }}
+        theme={ConfirmationDialogTheme.Alert}
+        confirmLabel={confirmation?.confirmLabel(ctx)}
+        onConfirm={() => {
+          if (confirmingAction) runAction(confirmingAction, ctx);
+        }}
+      >
+        {confirmingAction?.id === 'delete' ? (
+          <>
+            <p>
+              <span>Are you sure you want to delete</span>{' '}
+              <ResourceInline subject={ctx.subject} />
+            </p>
+            <ResourceUsage resource={ctx.resource} />
+          </>
+        ) : (
+          confirmation?.body(ctx)
+        )}
+      </ConfirmationDialog>
+      {CustomDeleteDialog && (
+        <CustomDeleteDialog
+          resource={ctx.resource}
+          show={showCustomDeleteDialog}
+          bindShow={setShowCustomDeleteDialog}
+          onDeleted={afterDelete}
+        />
+      )}
+      {/* Use the menu's own subject, not the current page's — a right-click can
+       * target a resource other than the one being viewed. */}
+      <ResourceCodeUsageDialog
+        subject={subject}
+        show={showCodeUsageDialog}
+        bindShow={setShowCodeUsageDialog}
+      />
+      {/* Mounted lazily on first use — most menus never open these. */}
+      {emojiPickerOpen !== undefined && (
+        <IconPickerDialog
+          resource={ctx.resource}
+          show={emojiPickerOpen}
+          onShowChange={setEmojiPickerOpen}
+        />
+      )}
+      {coverPickerOpen !== undefined && (
+        <CoverPickerDialog
+          resource={ctx.resource}
+          show={coverPickerOpen}
+          onShowChange={setCoverPickerOpen}
+        />
+      )}
+      {moveOpen !== undefined && (
+        <MoveResourceDialog
+          subject={subject}
+          show={moveOpen}
+          onShowChange={setMoveOpen}
+        />
+      )}
+      {pluginRunOpen !== undefined && ctx.drive !== undefined && (
+        <Suspense fallback={null}>
+          <RunPluginDialog
+            resource={ctx.resource}
+            drive={ctx.drive}
+            show={pluginRunOpen}
+            onShowChange={setPluginRunOpen}
+          />
+        </Suspense>
+      )}
+      {reportChatOpen !== undefined && (
+        <Suspense fallback={null}>
+          <ReportAIChatDialog
+            subject={subject}
+            show={reportChatOpen}
+            onClose={() => setReportChatOpen(false)}
+            onClosed={() => setReportChatOpen(undefined)}
+          />
+        </Suspense>
+      )}
+    </>
+  );
+}

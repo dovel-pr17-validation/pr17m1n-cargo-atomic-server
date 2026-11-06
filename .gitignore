@@ -1,0 +1,66 @@
+/target
+.envrc
+.env
+# Per-developer overrides. Vite loads `.env.local` in *every* mode, production
+# builds included, so a committed one bakes a local machine's URLs into shipped
+# bundles. Checked-in defaults belong in `.env.development` (dev-mode only).
+.env.local
+.env.*.local
+trace-*.json
+dev-drive-trace-*.json
+**/.temp
+.DS_Store
+artifact
+# Store for the e2e server (`browser/e2e/scripts/e2e-server.sh`) — test data
+# only, kept out of the dev store on purpose.
+/.e2e-store
+/.e2e-runs
+server/assets_tmp
+# Same, for the plugin assets `build.rs` stages before embedding them.
+server/integrations_assets_tmp
+server/js-build.log
+server/js-inputs.hash
+.netlify
+scratchpad
+# Local Claude Code state stays out; the shared cloud-session hook is tracked.
+**/.claude/*
+!/.claude/settings.json
+!/.claude/hooks/
+.antigravitycli
+
+# Release binaries and one-off rustc scratch files at repo root
+/build/
+/test_opts
+/test_parse
+/test_opts.rs
+/test_parse.rs
+/test_url.rs
+
+# Merge-tool backup files (*.orig, *.rej)
+*.orig
+*.rej
+
+# Ignore .cargo but not the config.
+.cargo/*
+!.cargo/config.toml
+
+.bin/
+.fastembed_cache
+
+# Local editor/agent configs and package-manager caches must never be committed.
+.pnpm-store/
+**/zed backup settings.json
+node_modules/
+# Raw footage and cuts from browser/e2e/scripts/record-*.mjs
+/browser/e2e/recordings/
+
+# Bundled by browser/data-browser/scripts/build-website-runtime.mjs, which
+# vite.config.ts runs on every vite / vitest start.
+/browser/data-browser/src/chunks/Website/runtime/search-view.html
+/browser/data-browser/src/chunks/Website/runtime/website-runtime.min.js
+
+# Machine-specific agent notes; never commit these
+CLAUDE.local.md
+AGENTS.local.md
+
+/e2e-test-results

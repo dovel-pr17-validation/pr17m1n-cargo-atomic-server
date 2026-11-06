@@ -1,0 +1,692 @@
+{{#title Installing AtomicServer}}
+
+# Setup / installation
+
+You can run AtomicServer in different ways:
+
+1. Using docker (probably the quickest): `docker run -p 80:80 -v atomic-storage:/atomic-storage ghcr.io/ontola/atomic-server`
+2. From a published [binary](https://github.com/ontola/atomic-server/releases)
+3. Using [Cargo](https://doc.rust-lang.org/cargo/getting-started/installation.html) from crates.io: `cargo install atomic-server`
+4. Manually from source
+
+If you want to run AtomicServer locally as a developer / contributor, check out [the Contributors guide](https://github.com/ontola/atomic-server/blob/develop/CONTRIBUTING.md).
+
+## Privacy: your server never phones home
+
+A self-hosted AtomicServer talks to nobody but you. There is no telemetry, no
+analytics, and no background reporting in the open-source build. It never
+contacts any control plane, and it does not know that a hosted service
+(AtomicCloud) exists — `GET /node-info` reports `managed: false` and no portal.
+
+The optional hosted-sync integration (heartbeat, per-drive quotas, enrollment
+reporting) is **opt-in and lives outside the open core**: it only runs in the
+separate closed managed-node wrapper, and only when that wrapper is explicitly
+configured with a control-plane URL. A stock `atomic-server` binary has none of
+that code compiled into a code path that runs by default — it installs an open
+sync policy (every drive allowed, no quotas) and passes a no-op readiness hook.
+So running your own node keeps your data, and your traffic, entirely yours.
+
+The only exception is [error reporting](#error-reporting-opt-in), which is off
+unless you configure it yourself.
+
+## Error reporting (opt-in)
+
+AtomicServer can report crashes and `error`-level log events to a
+[Sentry](https://sentry.io) project (or a self-hosted Sentry). This is off by
+default: without a DSN no Sentry client is created and nothing leaves the
+machine. To enable it, set:
+
+```sh
+# Server-side: panics and error logs, with the HTTP request that caused them.
+SENTRY_DSN=https://<key>@<host>/<project>
+# Front-end: hands the bundled data-browser its own (public) DSN at runtime,
+# so browser errors are reported too. Separate, because browser DSNs are public.
+SENTRY_DSN_BROWSER=https://<key>@<host>/<project>
+# Tag events with where they came from (optional).
+SENTRY_ENVIRONMENT=production
+```
+
+Only errors are sent. Performance tracing stays off (use `ATOMIC_TRACING=opentelemetry`
+for that), no personal data is attached, and the served front-end bundle is
+identical whether or not a DSN is set: it only contacts Sentry when the server
+injects one.
+
+## 1. Run using docker
+
+The quickest way to try it. This starts a server on port 80 and keeps its data in a named volume:
+
+```sh
+docker run -p 80:80 -v atomic-storage:/atomic-storage ghcr.io/ontola/atomic-server
+```
+
+Then open `http://localhost/` (port 80, so no port number). That is the first-run page, where you create your account. In Docker the server listens on port 80, so `http://localhost:9883/setup` only applies to the binary and `cargo run`, which default to port `9883`.
+
+Or with docker-compose. Set `ATOMIC_DOMAIN` to the name people will type in their browser (leave it out for localhost):
+
+```yaml
+services:
+  atomic-server:
+    image: ghcr.io/ontola/atomic-server
+    container_name: atomic-server
+    restart: unless-stopped
+    ports:
+      - 80:80
+    environment:
+      ATOMIC_DOMAIN: atomic.example.com
+    volumes:
+      - atomic-storage:/atomic-storage
+volumes:
+  atomic-storage:
+```
+
+Things to know:
+
+- **Port 443 only works with `--https`.** Publishing `-p 443:443` does nothing unless you also run the server with `--https` (and `--email`, see [HTTPS setup](#https-setup-on-a-vps-static-ip-required)), which makes it terminate TLS itself. If you put a reverse proxy in front instead, publish only port 80 and read [Behind a reverse proxy](#behind-a-reverse-proxy-nginx-caddy-traefik-ferron-cloudflare-tunnel).
+- **Hosts without IPv6.** The server binds to `::` by default. On a host or container without IPv6 support that fails with `Address family not supported by protocol`. Add `-e ATOMIC_IP=0.0.0.0` (or `ATOMIC_IP: 0.0.0.0` in docker-compose).
+- To pass other options, append them after the image name (e.g. `--port 9883`), or set the matching `ATOMIC_*` environment variables.
+- See the [list of all the available tags](https://github.com/ontola/atomic-server/pkgs/container/atomic-server) (`develop` is the very latest version). Docker downloads the `latest` tag by default.
+- To update, run `docker pull ghcr.io/ontola/atomic-server` and restart the container.
+
+## 2. Run pre-compiled binary
+
+Get the binaries from the [releases page](https://github.com/ontola/atomic-server/releases) and copy them to your `bin` folder.
+
+## 3. Install using cargo
+
+```sh
+# Install from source using cargo, and add it to your path
+# If things go wrong, check out `Troubleshooting compiling from source:` below
+cargo install atomic-server --locked
+# Check the available options and commands
+atomic-server --help
+# Run it!
+atomic-server
+```
+
+## 4. Compile from source
+
+```sh
+# make sure pnpm is installed and available in path! https://pnpm.io/
+pnpm --version
+git clone git@github.com:ontola/atomic-server.git
+cd atomic-server/server
+cargo run
+```
+
+If things go wrong while compiling from source:
+
+```sh
+# If cc-linker, pkg-config or libssl-dev is not installed, make sure to install them
+sudo apt-get install -y build-essential pkg-config libssl-dev --fix-missing
+```
+
+## Initial setup and configuration
+
+- You can configure the server by passing arguments (see `atomic-server --help`), or by setting ENV variables.
+- The server loads the `.env` from the current path by default. Create a `.env` file from the default template in your current directory with `atomic-server generate-dotenv`
+- After running the server, check the logs and take note of the `Agent Subject` and `Private key`. You should use these in the [`atomic-cli`](https://crates.io/crates/atomic-cli) and [atomic-data-browser](https://github.com/ontola/atomic-server/tree/develop/browser) clients for authorization.
+- A directory is made: `~/.config/atomic`, which stores your newly created Agent keys, the HTTPS certificates other configuration. Depending on your OS, the actual data is stored in different locations. See use the `show-config` command to find out where, if you need the files.
+- Visit `http://localhost:9883/setup` to **register your first (admin) user**. You can use an existing Agent, or create a new one. Note that if you create a `localhost` agent, it cannot be used on the web (since, well, it's local). More info and steps in [getting started with the GUI](gui.md).
+
+## Serving one Drive as your front page (opt-in)
+
+By default, opening `/` sends visitors who aren't signed in to the welcome /
+sign-in screen. That is the right default for a server hosting several Drives,
+or one whose root isn't meant to be public — it doesn't assume the root is a
+Drive that everybody may read.
+
+If your server hosts a single site, wiki or dataset that the public should just
+*see*, point `ATOMIC_HOME_DRIVE` at that Drive:
+
+```env
+# The Drive at the server root
+ATOMIC_HOME_DRIVE=internal:/
+
+# ...or a specific Drive
+# ATOMIC_HOME_DRIVE=atomic:{genesis}
+```
+
+Visiting `/` then opens that Drive directly, for signed-out visitors too.
+Signed-in users still reach their own Drives from the sidebar.
+
+Three things worth knowing:
+
+- **Make the Drive readable by the public Agent.** Otherwise signed-out
+  visitors get an authorization error instead of your front page. Open the
+  Drive, use `share` in the context menu, and give `public` read access.
+- **It costs nothing at runtime.** The subject is written into the HTML the
+  server already serves, so the browser routes to it on the first render —
+  no extra request, and no wait.
+- **`internal:` subjects are resolved for you.** The server rewrites
+  `internal:/` to its own absolute URL before handing it to the browser,
+  because a browser has no host to fetch a bare `internal:` subject from. You
+  can configure whichever form you have; both end up working.
+
+You can read the current setting back from the `/server` endpoint, under
+`https://atomicdata.dev/properties/server/homeDrive`.
+
+## Vector search embeddings (opt-in)
+
+Semantic search is opt-in twice over: it has to be **compiled in**, and then **switched on**.
+
+The official release binaries and the default `cargo install atomic-server` build do **not** include it, because the embedding stack (fastembed, lancedb, arrow, ort) is a very large dependency for something most deployments never turn on. To get it, build from source with the feature enabled:
+
+```sh
+cargo install atomic-server --features vector-search
+```
+
+That build needs `protoc` (`protobuf-compiler`) available. It does not currently work for musl targets, where `ort` has no prebuilt ONNX Runtime binary.
+
+With such a build, pass **`--enable-vector-index`** (or set **`ATOMIC_ENABLE_VECTOR_INDEX`**) to turn it on, since loading embedding models and indexing every write has a real performance cost. Passing the flag to a build that lacks the feature logs a warning and does nothing. Once enabled, the server runs [fastembed](https://github.com/Anush008/fastembed-rs) locally by default. To use [OpenRouter](https://openrouter.ai/) embeddings instead, pass **`--openrouter-api-key`** and **`--openrouter-embedding-model`** (or set **`OPENROUTER_API_KEY`** and **`OPENROUTER_EMBEDDING_MODEL`** in your environment or `.env`). **`--openrouter-embedding-dimensions`** / **`OPENROUTER_EMBEDDING_DIMENSIONS`** is optional (some models ignore it). **`--gpu-indexing`** / **`ATOMIC_GPU_INDEXING`** uses GPU acceleration for the default local embedding and reranker, not for OpenRouter.
+
+## Running using a tunneling service (easy mode)
+
+If you want to make your server available on the web, but don't want (or cannot) deal with setting up port-forwarding and DNS, you can use a tunneling service.
+It's the easiest way to get a public HTTPS address, yet you keep full control over your data.
+
+We recommend a [cloudflared](https://developers.cloudflare.com/cloudflare-one/connections/connect-networks/downloads/) quick tunnel. It needs no account, and it handles WebSockets, which AtomicServer needs for real-time sync. Other tunnels such as tunnelto are known to drop the WebSocket connection, which leaves the app stuck on "Loading".
+
+```sh
+# 1. Start the tunnel. It prints a public address like https://random-words.trycloudflare.com
+cloudflared tunnel --url http://localhost:9883
+
+# 2. In a second terminal, start the server with that host as its domain
+ATOMIC_DOMAIN=random-words.trycloudflare.com \
+ATOMIC_SERVER_URL=https://random-words.trycloudflare.com \
+atomic-server --initialize
+```
+
+- `ATOMIC_DOMAIN` must be the **public host** (no scheme, no port). The server uses it to decide which origin it accepts logins for. Leave it at `localhost` and sign-in over the WebSocket fails with `does not name this server`.
+- `ATOMIC_SERVER_URL` (or `--server-url`) is the public URL including `https://`. The tunnel terminates TLS, so the server needs to be told its public address, see [Behind a reverse proxy](#behind-a-reverse-proxy-nginx-caddy-traefik-ferron-cloudflare-tunnel).
+- Keep the server on plain HTTP (no `--https`); cloudflared forwards to it.
+- A quick tunnel is **public while it runs**, and its address changes on every start, so use it for testing and demos. For a stable address, use a named Cloudflare Tunnel, or a reverse proxy on your own domain.
+- Before you share the address, read [Putting your server on the internet](#putting-your-server-on-the-internet).
+
+## Behind a reverse proxy (nginx, Caddy, Traefik, Ferron, Cloudflare Tunnel)
+
+`--https` means that atomic-server terminates TLS itself. Behind a proxy that does it for you, leave it off, and tell the server its public URL instead:
+
+```ini
+ATOMIC_PORT=80
+ATOMIC_HTTPS=false
+ATOMIC_DOMAIN=atomic.example.com
+ATOMIC_SERVER_URL=https://atomic.example.com
+```
+
+Without `ATOMIC_SERVER_URL` (or `--server-url`) the server builds its own address from `--https` and `--domain`, so it calls itself `http://atomic.example.com`. Resources it names itself, such as `/query` and everything delivered over the WebSocket, then reach your `https://` page as `http://` links, which the browser blocks as mixed content. Child resources of a Drive fail to load and real-time sync stops. The server logs a warning at boot when it sees a public-looking `ATOMIC_DOMAIN` with `ATOMIC_HTTPS` off and no server URL.
+
+For requests that arrive through the proxy the server also honours `X-Forwarded-Proto` and `X-Forwarded-Host`, for hosts it is configured to serve, so make your proxy send them. `ATOMIC_SERVER_URL` is what applies where there is no request, and is the fallback when the headers are missing.
+
+## HTTPS Setup on a VPS (static IP required)
+
+You'll probably want to make your Atomic Data available through HTTPS on some server.
+You can use the embedded HTTPS / TLS setup powered by [LetsEncrypt](https://letsencrypt.org/), [acme_lib](https://docs.rs/acme-lib/0.8.1/acme_lib/index.html) and [rustls](https://github.com/ctz/rustls).
+
+You can do this by passing these flags:
+
+Run the server: `atomic-server --https --email some@example.com --domain example.com`.
+
+You can also set these things using a `.env` or by setting them some other way.
+
+Make sure the server is accessible at `ATOMIC_DOMAIN` at port 80, because Let's Encrypt will send an HTTP request to this server's `/.well-known` directory to check the keys.
+The default Ports are `9883` for HTTP, and `9884` for HTTPS.
+If you're running the server publicly, set these to `80` and `443`: `atomic-server --https --port 80 --port-https 443`.
+It will now initialize the certificate.
+Read the logs, watch for errors.
+
+HTTPS certificates are automatically renewed when the server is restarted, and the certs are 4 weeks or older.
+They are stored in your `.config/atomic/` dir.
+
+## HTTPS Setup using external HTTPS proxy
+
+Atomic-server has built-in HTTPS support using letsencrypt, but there are usecases for using external TLS source (e.g. Traeffik / Nginx / Ingress).
+
+To do this, users need to set these ENVS:
+
+```ini
+ATOMIC_DOMAIN=example.com
+# We'll use this regular HTTP port, not the HTTPS one
+ATOMIC_PORT=80
+# Disable built-in letsencrypt
+ATOMIC_HTTPS=false
+```
+
+`ATOMIC_DOMAIN` is what the server uses to build its own links, so set it to the
+name your users type — not to `localhost`, even though that is where the proxy
+forwards to. Getting this wrong mostly shows up as links pointing at the wrong
+host.
+
+Behind a proxy the server cannot tell that it is reachable from the internet:
+the connection arrives from the proxy, on the local interface. It will not warn
+you. See [Putting your server on the internet](#putting-your-server-on-the-internet)
+for what to set so strangers cannot store their data on your disk.
+
+## Make your server shareable
+
+Invite links and sync QR codes only work from a **public HTTPS address**. Browsers only allow the local storage the app needs on a secure origin (`https://`, or `http://localhost`), and a link that says `localhost` means something different on every device. So before you invite anyone or pair a phone:
+
+1. **Give the server a public name.** Set `ATOMIC_DOMAIN` to the name people type in their browser, for example `ATOMIC_DOMAIN=atomic.example.com`, with a DNS record pointing at your server.
+2. **Serve it over HTTPS.** Either let the server do it with `--https` (and `--email`, see [HTTPS Setup on a VPS](#https-setup-on-a-vps-static-ip-required)), or put a reverse proxy in front and set `ATOMIC_SERVER_URL=https://atomic.example.com` (see [Behind a reverse proxy](#behind-a-reverse-proxy-nginx-caddy-traefik-ferron-cloudflare-tunnel)). For a quick test, a [tunnel](#running-using-a-tunneling-service-easy-mode) gives you a public HTTPS address without any DNS.
+3. **Say who owns it**, so strangers cannot use your disk. Order matters, because the ID comes from an account:
+   1. Start the server and create your account (the first-run page, see [Initial setup](#initial-setup-and-configuration)).
+   2. Open **Settings** and copy your **Agent ID** (it starts with `atomic:agent:`). Use the ID, never the secret.
+   3. Restart the server with `ATOMIC_OWNER_AGENT=atomic:agent:AbCd...`. This selects owner mode (`ATOMIC_HOST_MODE=owner`) by itself. Setting `ATOMIC_HOST_MODE=owner` without an `ATOMIC_OWNER_AGENT` makes the server refuse to start, and `ATOMIC_HOST_MODE=open` deliberately keeps sign-up open.
+
+   Details are in [Putting your server on the internet](#putting-your-server-on-the-internet).
+
+## Putting your server on the internet
+
+By default, **anyone who can reach your server can create an account on it and
+store their data on your disk.** That is the right behaviour on your laptop or a
+home network. On a public address it makes your server an open sign-up form for
+free storage.
+
+This is not about privacy of what you already have — your existing Drives stay
+as private as their permissions say. It is about who may put *new* data here.
+
+### Name yourself as the owner
+
+You need your Agent ID: a public identifier that looks like
+`atomic:agent:AbCd...`. If you do not have one yet, run the server on your own
+machine first, click **Create account**, and copy the Agent ID from Settings.
+Your phone or the desktop app work equally well — an identity is a keypair, it
+does not belong to any particular server.
+
+Then set it on the server that will be public:
+
+```ini
+ATOMIC_OWNER_AGENT=atomic:agent:AbCd...
+```
+
+That is the whole setup. Restart, and the server will say so at boot:
+
+```text
+Only its owner can create new Drives here (atomic:agent:AbCd...).
+```
+
+> **Use the Agent ID, never the secret.** The ID is public and safe to put in a
+> config file. The secret is your private key; the server never needs it and
+> refuses to start if you paste one here.
+
+### What changes, and what does not
+
+| Still works | Now refused |
+| --- | --- |
+| Anyone reading a Drive you made public | A stranger creating an account here |
+| People you invited, in the Drives you invited them to | A stranger pushing a new Drive over sync |
+| Your own other devices, signing in as you | A stranger uploading files to a Drive they invented |
+| Every Drive already on this server, including guests' | |
+
+Drives that already exist keep working. Turning this on never revokes access to
+data that is already on the disk — including Drives created before you set it,
+or by people you invited.
+
+New Drives you create are enrolled automatically, because you are the owner. Your
+second device is the same Agent, so it needs nothing extra.
+
+### If you are behind a reverse proxy or a tunnel
+
+**The server cannot detect this, and will not warn you.** With nginx, Caddy,
+Traefik, Docker port mapping, a Cloudflare Tunnel, or Tailscale in front, every
+request arrives from the proxy on a local address, and `ATOMIC_DOMAIN` is often
+still `localhost`. As far as the process can tell, it is a private machine.
+
+If your server is reachable from the internet by any route, set
+`ATOMIC_OWNER_AGENT`. Nothing else infers it for you.
+
+Also set `ATOMIC_SERVER_URL` to the public address, see
+[Behind a reverse proxy](#behind-a-reverse-proxy-nginx-caddy-traefik-ferron-cloudflare-tunnel).
+
+### Running an open server on purpose
+
+If you *want* a server other people can sign up on — a shared instance for a
+team or a community — that is still supported, and is what you get by default.
+To keep it open and silence the boot warning, say so:
+
+```ini
+ATOMIC_HOST_MODE=open
+```
+
+Do this deliberately. It means anyone who can reach the address can store data
+on your disk, and there is currently no quota.
+
+### Troubleshooting
+
+**"ATOMIC_HOST_MODE=owner needs ATOMIC_OWNER_AGENT to be set"** — you asked for a
+gated server without saying whose it is. Set `ATOMIC_OWNER_AGENT`, or use
+`ATOMIC_HOST_MODE=open` if you meant to run an open one. The server refuses to
+start rather than falling back to open, because a typo in a config file should
+not quietly publish your disk.
+
+**"ATOMIC_OWNER_AGENT looks like an Agent *secret*"** — you pasted the private
+key. Open the secret and use the `subject` field inside it, or copy the Agent ID
+from Settings.
+
+**"This server does not host new Drives"** — someone (possibly you, in another
+browser) tried to create an account. Sign in with the owner's secret instead. If
+you meant to let this person in, invite them to a specific Drive rather than
+giving them one of their own.
+
+**I locked myself out.** You did not: `ATOMIC_OWNER_AGENT` is read fresh at every
+boot and is never stored. Change it and restart, or remove it to go back to an
+open server.
+
+## Using `systemd` to run Atomic-Server as a service
+
+In Linux operating systems, you can use `systemd` to manage running processes.
+You can configure it to restart automatically, and collect logs with `journalctl`.
+
+Create a service:
+
+```sh
+nano /etc/systemd/system/atomic.service
+```
+
+Add this to its contents, make changes if needed:
+
+```service
+[Unit]
+Description=Atomic-Server
+#After=network.targetdd
+StartLimitIntervalSec=0[Service]
+
+[Service]
+Type=simple
+Restart=always
+RestartSec=1
+User=root
+ExecStart=/root/atomic-server
+WorkingDirectory=/root/
+EnvironmentFil=/root/.env
+
+[Install]
+WantedBy=multi-user.target
+```
+
+```sh
+# start / status / restart commands:
+systemctl start atomic
+systemctl status atomic
+systemctl restart atomic
+# show recent logs, follow them on screen
+journalctl -u atomic.service --since "1 hour ago" -f
+```
+
+## Store size and automatic compaction
+
+The store is one [redb](https://github.com/cberner/redb) file,
+`<data-dir>/store/atomic.redb`. redb never gives pages back to the filesystem
+on its own: an overwrite or delete frees pages that later writes may reuse,
+but the file only shrinks when its *tail* happens to be free. A store that has
+churned through many resources (long editing sessions, imports that were
+deleted again, test data) stays as large as its high-water mark, and opening
+a large file is slow: the open-time `fsync` scales with file size, so a
+multi-GB store can take a minute to open where a fresh one takes
+milliseconds.
+
+Every boot logs the file's size and open time, and how much of it is dead:
+
+```
+Store /var/lib/atomic/store/atomic.redb is 1843.2 MiB on disk (2048.0 MiB long), opened in 21.4s
+Store pages: 224511 allocated (...) = 877.0 MiB live; ... 966.2 MiB (52%) reclaimable by compaction
+```
+
+"On disk" is what the file costs; the length also includes headroom redb
+reserves ahead of writes, which is sparse and costs nothing until used.
+Reclaimable space is what is on disk minus the pages still in use. Above
+1 GiB on disk the first line is a warning. When both of these hold, the
+server compacts the file **before** it starts listening:
+
+- the file is at least `--auto-compact-min-mb` on disk
+  (`ATOMIC_AUTO_COMPACT_MIN_MB`, default `256`): a small file opens fast
+  whatever its layout, so a startup pause is not worth it;
+- at least `--auto-compact-min-reclaimable-percent`
+  (`ATOMIC_AUTO_COMPACT_MIN_RECLAIMABLE_PERCENT`, default `30`) of what is on
+  disk is reclaimable: compaction reads and rewrites the whole file, and a
+  store with steady churn always carries some free pages that the next writes
+  reuse.
+
+Compaction logs the before/after sizes and how long it took. It is
+`O(file size)`, seconds per GB on an SSD, and it runs while the server holds
+the store's exclusive lock, so the server is not reachable until it is done.
+If it fails for any reason the store opens as it was and the failure is a
+warning, never a refused start. Set `--auto-compact false`
+(`ATOMIC_AUTO_COMPACT=false`) to turn it off, for example on a node where
+every second of downtime matters and you would rather schedule it. That also
+skips the reclaimable-space measurement, which walks every page of the file.
+The size and open-time line is logged either way.
+
+`atomic-server compact` does the same by hand, with the server stopped. Use
+it after a large clean-up, or when the boot log says a store below the size
+floor has a lot to reclaim.
+
+Neither applies to the browser (OPFS) store or to a legacy sled store.
+
+## AtomicServer CLI options / ENV vars
+
+(run `atomic-server --help` to see the latest options)
+
+```
+Create, share and model Atomic Data with this graph database server. Run atomic-server without any arguments to start the server. Use --help to learn about the options.
+
+Usage: atomic-server [OPTIONS] [COMMAND]
+
+Commands:
+  export
+          Create and save a JSON-AD backup of the store
+  import
+          Import a JSON-AD file or stream to the store. By default creates Commits for all changes, maintaining version history. Use --force to allow importing other types of files
+  generate-dotenv
+          Creates a `.env` file in your current directory that shows various options that you can set
+  show-config
+          Returns the currently selected options, based on the passed flags and parsed environment variables
+  reset
+          Danger! Removes all data from the store
+  compact
+          Compact the on-disk redb file (rebuilds page layout, truncates dead-page tail). Slow — typically minutes on a multi-GB store — but makes future boots dramatically faster because the open-time `fsync` cost scales with file size. Server MUST be stopped: redb takes an exclusive file lock and will fail otherwise
+  help
+          Print this message or the help of the given subcommand(s)
+
+Options:
+      --initialize
+          Recreates the initial Invite for creating a new Root User, prints it to console. Also re-runs various populate commands, and re-builds the index
+
+          [env: ATOMIC_INITIALIZE=]
+
+      --rebuild-indexes <INDEX_TYPE>
+          Re-builds the indexes. Parses all the resources. Do this when updating requires it, or if you have issues with Collections / Queries / Search
+          [possible values: all, atoms, vector, search]
+
+          [env: ATOMIC_REBUILD_INDEX=]
+
+      --development
+          Use staging environments for services like LetsEncrypt
+
+          [env: ATOMIC_DEVELOPMENT=]
+
+      --envelope-retention <ENVELOPE_RETENTION>
+          Which signed commit envelopes this node keeps per resource: `latest` (the envelope that produced the current state; the default) or `all` (every envelope, so History shows a verified signer per change)
+
+          [env: ATOMIC_ENVELOPE_RETENTION=]
+          [default: latest]
+
+      --auto-compact <AUTO_COMPACT>
+          Compact the store file at startup when it is at least `--auto-compact-min-mb` and at least `--auto-compact-min-reclaimable-percent` of it is dead space (pages freed by overwrites and deletes that redb never returns to the filesystem). The server listens only when the compaction is done: expect seconds per GB. `false` skips the check; `atomic-server compact` does the same by hand while the server is stopped
+
+          [env: ATOMIC_AUTO_COMPACT=]
+          [default: true]
+          [possible values: true, false]
+
+      --auto-compact-min-mb <AUTO_COMPACT_MIN_MB>
+          Store files smaller than this many MiB are never compacted at startup: they open fast whatever their layout
+
+          [env: ATOMIC_AUTO_COMPACT_MIN_MB=]
+          [default: 256]
+
+      --auto-compact-min-reclaimable-percent <AUTO_COMPACT_MIN_RECLAIMABLE_PERCENT>
+          Startup compaction runs only when at least this percentage of the store file is reclaimable (0-100)
+
+          [env: ATOMIC_AUTO_COMPACT_MIN_RECLAIMABLE_PERCENT=]
+          [default: 30]
+
+      --write-rate-limit <WRITE_RATE_LIMIT>
+          How many write requests per minute one signed agent may make (commits over HTTP or WebSocket, uploads, blob puts, peer sync pushes, resource posts) before the server answers `429 Too Many Requests`. The budget refills continuously, so a burst up to this size is fine. `0` disables the limit
+
+          [env: ATOMIC_WRITE_RATE_LIMIT=]
+          [default: 6000]
+
+      --anonymous-write-rate-limit <ANONYMOUS_WRITE_RATE_LIMIT>
+          The same budget for write requests that carry no signed agent, keyed by the connecting peer address. `0` disables the limit
+
+          [env: ATOMIC_ANONYMOUS_WRITE_RATE_LIMIT=]
+          [default: 60]
+
+      --commit-soft-limit <COMMIT_SOFT_LIMIT>
+          How many commits may be in flight (being applied or queued for the single redb writer) before the node starts telling clients to commit less often. Up to this many the `pace_ms` hint is 0. Clients that advertise `commit-pace` (WebSocket) or read `X-Atomic-Pace-Ms` (HTTP) then stretch their commit interval, so each commit carries more edits. The hint rises linearly to 10 s at `--commit-hard-limit`. See `docs/src/websockets.md`
+
+          [env: ATOMIC_COMMIT_SOFT_LIMIT=]
+          [default: 32]
+
+      --commit-hard-limit <COMMIT_HARD_LIMIT>
+          How many commits may be in flight before new ones are refused up front with `BUSY` (WebSocket error code 12) or `503` with `Retry-After` (HTTP). Nothing is lost: the client keeps the edit and retries after the jittered delay. `0` disables both the pace hint and the refusal
+
+          [env: ATOMIC_COMMIT_HARD_LIMIT=]
+          [default: 256]
+
+      --domain <DOMAIN>
+          The origin domain where the app is hosted, without the port and schema values
+
+          [env: ATOMIC_DOMAIN=]
+          [default: localhost]
+
+  -p, --port <PORT>
+          The port where the HTTP app is available. Set to 80 if you want this to be available on the network
+
+          [env: ATOMIC_PORT=]
+          [default: 9883]
+
+      --port-https <PORT_HTTPS>
+          The port where the HTTPS app is available. Set to 443 if you want this to be available on the network
+
+          [env: ATOMIC_PORT_HTTPS=]
+          [default: 9884]
+
+      --ip <IP>
+          The IP address of the server. Set to :: if you want this to be available to other devices on your network
+
+          [env: ATOMIC_IP=]
+          [default: ::]
+
+      --https
+          Use HTTPS instead of HTTP. Will get certificates from LetsEncrypt fully automated
+
+          [env: ATOMIC_HTTPS=]
+
+      --https-dns
+          Initializes DNS-01 challenge for LetsEncrypt. Use this if you want to use subdomains
+
+          [env: ATOMIC_HTTPS_DNS=]
+
+      --email <EMAIL>
+          The contact mail address for Let's Encrypt HTTPS setup
+
+          [env: ATOMIC_EMAIL=]
+
+      --script <SCRIPT>
+          Custom JS script to include in the body of the HTML template
+
+          [env: ATOMIC_SCRIPT=]
+          [default: ]
+
+      --config-dir <CONFIG_DIR>
+          Path for atomic data config directory. Defaults to "~/.config/atomic/""
+
+          [env: ATOMIC_CONFIG_DIR=]
+
+      --data-dir <DATA_DIR>
+          Path for atomic data store folder. Contains your Store, uploaded files and more. Default value depends on your OS
+
+          [env: ATOMIC_DATA_DIR=]
+
+      --cache-dir <CACHE_DIR>
+          Path for the atomic data cache folder. Contains search index, temp files and more. Default value depends on your OS
+
+          [env: ATOMIC_CACHE_DIR=]
+
+      --public-mode
+          CAUTION: Skip authentication checks, making all data publicly readable. Improves performance
+
+          [env: ATOMIC_PUBLIC_MODE=]
+
+      --server-url <SERVER_URL>
+          The full URL of the server. It should resolve to the home page. Set this if you use an external server or tunnel, instead of directly exposing atomic-server. If you leave this out, it will be generated from `domain`, `port` and `http` / `https`
+
+          [env: ATOMIC_SERVER_URL=]
+
+      --log-level <LOG_LEVEL>
+          How much logs you want. Also influences what is sent to your trace service, if you've set one (e.g. OpenTelemetry)
+
+          [env: RUST_LOG=trace]
+          [default: info]
+          [possible values: warn, info, debug, trace]
+
+      --trace <TRACE>
+          How you want to trace what's going on with the server. Useful for monitoring performance and errors in production. Combine with `log_level` to get more or less data (`trace` is the most verbose)
+
+          [env: ATOMIC_TRACING=opentelemetry]
+          [default: stdout]
+
+          Possible values:
+          - stdout:
+            Log to STDOUT in your terminal
+          - chrome:
+            Create a file in the current directory with tracing data, that can be opened with the chrome://tracing/ URL
+          - opentelemetry:
+            Log to a local OpenTelemetry service (e.g. Jaeger), using default ports
+
+      --slow-mode
+          Introduces random delays in the server, to simulate a slow connection. Useful for testing
+
+          [env: ATOMIC_SLOW_MODE=]
+
+      --clear-remote-cache
+          Removes all remote resources from the store
+
+          [env: ATOMIC_CLEAR_REMOTE_CACHE=]
+
+      --gpu-indexing
+          Use the GPU (if available) for processing vector search embeddings
+
+          [env: ATOMIC_GPU_INDEXING=]
+
+      --enable-vector-index
+          Opt in to vector embedding models and Lance index builds for semantic search. Off by default: loading embedding models and indexing every write has a real performance cost, so it should be a deliberate choice rather than the default.
+
+          [env: ATOMIC_ENABLE_VECTOR_INDEX=]
+
+      --skip-vector-index
+          Deprecated: vector indexing is now off by default. Kept only so existing scripts/deployments that pass this flag keep working; it is a no-op unless combined with `--enable-vector-index`, in which case it forces indexing off again.
+
+          [env: ATOMIC_SKIP_VECTOR_INDEX=]
+
+      --openrouter-api-key <OPENROUTER_API_KEY>
+          OpenRouter API key for remote embeddings instead of local fastembed
+
+          [env: OPENROUTER_API_KEY=]
+
+      --openrouter-embedding-model <OPENROUTER_EMBEDDING_MODEL>
+          OpenRouter embedding model id (required when `OPENROUTER_API_KEY` is set)
+
+          [env: OPENROUTER_EMBEDDING_MODEL=]
+
+      --openrouter-embedding-dimensions <OPENROUTER_EMBEDDING_DIMENSIONS>
+          Optional embedding vector dimensions for OpenRouter (JSON `dimensions` field; not all models honor it). Empty string is treated as unset.
+
+          [env: OPENROUTER_EMBEDDING_DIMENSIONS=]
+
+  -h, --help
+          Print help information (use `-h` for a summary)
+
+  -V, --version
+          Print version information
+```

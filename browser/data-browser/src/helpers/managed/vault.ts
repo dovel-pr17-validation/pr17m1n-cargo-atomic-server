@@ -1,0 +1,1470 @@
+import { AGENT_VAULT_PROOF_MESSAGE, decodeB64 } from '@tomic/lib';
+import { managedFetch } from './api';
+
+/**
+ * Cloud Vault client: encrypted, blind backup of a drive.
+ *
+ * The division of labour is deliberate. **WASM does crypto and format, this
+ * file does the network.** `vaultExport` hands back bytes that are already
+ * sealed; everything here only ever moves ciphertext around. The control plane
+ * brokers presigned URLs and never sees a payload, and object bytes go straight
+ * to storage rather than through the API — which is why a backup of a large
+ * drive does not cost us bandwidth.
+ *
+ * What that means for reading this file: nothing here can leak drive contents,
+ * because nothing here can read them. The security-critical code is in
+ * `atomic_lib::vault`; this is plumbing.
+ */
+
+/** Signs the fixed derivation message. Satisfied by `@tomic/lib`'s `Agent`. */
+export type VaultProofSigner = {
+  signBytes(data: Uint8Array): Promise<string>;
+  /** The proof computed from the raw key at sign-in, if the agent carries it. */
+  vaultProof?: string;
+  /**
+   * Whether `signBytes` is reproducible. Absent means unknown, which is
+   * treated as "prove it" rather than as a promise — see {@link agentVaultProof}.
+   */
+  signsDeterministically?: boolean;
+};
+
+/**
+ * The agent's proof, from which its vault key-encryption key is derived.
+ *
+ * A signature over a fixed message, not the private key. The browser's
+ * `CryptoProvider` exposes signing rather than key bytes — deliberately, so
+ * hardware-backed and non-extractable keys stay possible. RFC 8032 Ed25519
+ * signatures are deterministic, which is what lets every device holding the
+ * agent reproduce the same proof and therefore the same key — but that is a
+ * property of the implementation, and WebKit's WebCrypto randomizes the nonce.
+ * A Safari session signing live got a fresh proof every call: enrolling there
+ * wrote a wrapper no device could open, and restoring there failed with "no
+ * wrapper in this envelope accepted that credential" against a backup made
+ * anywhere else.
+ *
+ * So the proof the agent computed from its raw key at sign-in wins when it has
+ * one. Without it, a live signature is only trusted once it has reproduced
+ * itself; a signer that cannot is refused rather than handed a key it will
+ * never derive again.
+ *
+ * It also has exactly one representation, unlike "the agent secret", which in
+ * this codebase means the base64 blob, the `privateKey` inside it, or the
+ * decoded seed depending on who is asking. Wrapping under one of those and
+ * unwrapping with another produced an envelope nothing could open.
+ */
+export async function agentVaultProof(
+  signer: VaultProofSigner,
+  proofMessage: Uint8Array,
+): Promise<Uint8Array> {
+  if (
+    signer.vaultProof &&
+    bytesEqual(proofMessage, AGENT_VAULT_PROOF_MESSAGE)
+  ) {
+    return checkedSignature(signer.vaultProof);
+  }
+
+  const first = await signer.signBytes(proofMessage);
+
+  // Only a signer that positively declares itself deterministic is taken at
+  // its word. `false` and "didn't say" both have to reproduce the signature
+  // before it is allowed to become a key: an unknown signer that turns out to
+  // randomize is exactly the case this guard exists for, and trusting silence
+  // is how one would get past it.
+  if (signer.signsDeterministically !== true) {
+    const second = await signer.signBytes(proofMessage);
+
+    if (second !== first) {
+      throw new Error(
+        'This browser signs differently every time, so it cannot reproduce ' +
+          'the credential your backups are wrapped under. Sign in with your ' +
+          'recovery code or secret again on this browser to fix that.',
+      );
+    }
+  }
+
+  return checkedSignature(first);
+}
+
+function checkedSignature(signatureB64: string): Uint8Array {
+  const signature = new Uint8Array(decodeB64(signatureB64));
+
+  if (signature.length !== 64) {
+    throw new Error(
+      `Expected a 64-byte agent signature, got ${signature.length} bytes.`,
+    );
+  }
+
+  return signature;
+}
+
+function bytesEqual(a: Uint8Array, b: Uint8Array): boolean {
+  return a.length === b.length && a.every((byte, i) => byte === b[i]);
+}
+
+/**
+ * This install's lane identifier, as 64 hex characters.
+ *
+ * Each device appends only to its own lane, so the id only has to be stable and
+ * distinct — the control plane validates the shape, not that it is a real
+ * public key. Per-device *keys* are deliberately out of v1 scope
+ * (`CLOUD_VAULT_ARCHITECTURE.md`, decision 7): they add ceremony without a v1
+ * win, and the lane exists to avoid write contention rather than to prove
+ * authorship.
+ *
+ * Derived from the existing per-install device id, so it survives reloads. If
+ * local storage is cleared the device gets a new id and therefore a new lane —
+ * harmless, because a fresh lane simply starts at segment 1 and restore spans
+ * every lane in the drive.
+ */
+export async function vaultLaneId(deviceId: string): Promise<string> {
+  const digest = await crypto.subtle.digest(
+    'SHA-256',
+    new TextEncoder().encode(`atomic-vault-lane:${deviceId}`),
+  );
+
+  return Array.from(new Uint8Array(digest))
+    .map(b => b.toString(16).padStart(2, '0'))
+    .join('');
+}
+
+/** One confirmed object, from `GET /api/cloud-vault/{drive}/objects`. */
+export type VaultObject = {
+  object_id: string;
+  object_key: string;
+  kind: string;
+  size_bytes: number;
+  key_epoch: number;
+  lane_device_pubkey: string | null;
+  segment: number | null;
+};
+
+type UploadUrl = {
+  already_stored?: boolean;
+  object_id: string;
+  object_key: string;
+  url: string;
+  method: string;
+  headers: [string, string][];
+  size_bytes: number;
+};
+
+type DownloadUrl = {
+  object_id: string;
+  object_key: string;
+  url: string;
+};
+
+export type VaultEnrollment = {
+  drive_name?: string | null;
+  drive_emoji?: string | null;
+  id: string;
+  drive_subject: string;
+  /** The agent that enrolled it; an account may hold several agents' drives. */
+  agent_subject?: string;
+  drive_pseudonym: string;
+  status: string;
+  used_bytes: number;
+  quota_bytes: number;
+  last_backup_at: number | null;
+  /**
+   * The key epoch this drive's uploads must be sealed under. Bumped by a
+   * re-key; the control plane refuses objects declaring any other epoch.
+   *
+   * Optional only for the deploy window in which a control plane predating
+   * epoch tracking is still answering — callers read it as `?? 1`, the epoch
+   * every drive started at.
+   */
+  key_epoch?: number;
+};
+
+export type BackupOutcome =
+  | { status: 'nothing-to-do' }
+  | {
+      status: 'backed-up';
+      /** `'pack'` for an incremental delta, `'checkpoint'` for a fresh anchor. */
+      kind: SegmentKind;
+      resources: number;
+      /**
+       * Resources this pass skipped because they had not changed since the last
+       * one. On a healthy incremental pass this is nearly the whole drive.
+       */
+      unchanged: number;
+      bytes: number;
+      objectKey: string;
+    };
+
+export type SegmentKind = 'pack' | 'checkpoint';
+
+export type RestoreOutcome = {
+  packsRead: number;
+  resourcesRestored: number;
+  tombstonesApplied: number;
+  /** Objects the newest checkpoint subsumed, so they were never read. */
+  objectsSkipped: number;
+  /**
+   * Objects that would not open. Non-zero means part of the vault is corrupt or
+   * foreign — everything else still restored, and reporting a clean restore
+   * without mentioning this would be a lie.
+   */
+  objectsUnreadable: number;
+};
+
+/** What a `VaultCheckpointRecord` looks like on the wire. */
+export type VaultCheckpoint = {
+  /**
+   * The id a snapshot is listed under in `usage.snapshots`. Optional only
+   * because older control planes may not send it.
+   */
+  id?: string;
+  checkpoint_n: number;
+  /** Device pubkey → last inclusive segment this checkpoint provably holds. */
+  coverage: Record<string, number>;
+  checkpoint_object_id: string;
+  created_at: number;
+};
+
+/**
+ * The subset of the WASM `ClientDb` this module needs.
+ *
+ * Declared structurally rather than imported so this file does not depend on
+ * which wasm binding module the host wires up — the worker and the tests pass
+ * different ones.
+ */
+export type VaultCapableDb = {
+  vaultExport(
+    driveSubject: string,
+    key: Uint8Array,
+    keyEpoch: number,
+    drivePseudonym: string,
+    devicePubkey: string,
+    segment: number,
+    checkpointN: number,
+    driveHasCheckpoint: boolean,
+    observedLanes: Record<string, number>,
+    /**
+     * A checkpoint keeps only each resource's current state (shallow
+     * snapshots, no signed envelopes). Ignored by delta packs. Omit for the
+     * default, which keeps the whole edit history.
+     */
+    currentStateOnly?: boolean,
+  ): Promise<{
+    objectKey: string;
+    sealed: Uint8Array;
+    kind: SegmentKind;
+    resources: number;
+    unchanged: number;
+    tombstones: number;
+    /** Checkpoints only; published verbatim to the control plane. */
+    coverage: Record<string, number>;
+  } | null>;
+  vaultImport(
+    key: Uint8Array,
+    keyEpoch: number,
+    drivePseudonym: string,
+    devicePubkey: string,
+    objects: { objectKey: string; sealed: Uint8Array }[],
+  ): Promise<RestoreOutcome>;
+  /** Marks a sealed segment as durably stored. See `backupDrive`. */
+  vaultCommitSegment(
+    drivePseudonym: string,
+    devicePubkey: string,
+    segment: number,
+  ): Promise<void> | void;
+};
+
+// A plain function uses Wuchale's non-reactive runtime. Translating directly
+// in an Error constructor incorrectly injects a React hook outside a component.
+function vaultSessionEndedMessage(): string {
+  return 'Your account session has ended. Sign in again to resume backup.';
+}
+
+export class VaultSessionEndedError extends Error {
+  constructor() {
+    super(vaultSessionEndedMessage());
+    this.name = /* @wc-ignore */ 'VaultSessionEndedError';
+  }
+}
+
+/** The control plane does not offer this route (yet): a 404 or a non-JSON page. */
+export class VaultNotAvailableError extends Error {
+  constructor() {
+    super(vaultNotAvailableMessage());
+    this.name = /* @wc-ignore */ 'VaultNotAvailableError';
+  }
+}
+
+function vaultNotAvailableMessage(): string {
+  return 'This is not available on your account yet.';
+}
+
+function storageNotAvailableMessage(): string {
+  return 'Storage details are not available on your account yet.';
+}
+
+/** Turn "the route is missing" into a plain sentence about storage. */
+async function storageApi<T>(
+  path: string,
+  init?: RequestInit & { body?: string },
+): Promise<T> {
+  try {
+    return await api<T>(path, init);
+  } catch (e) {
+    if (
+      e instanceof VaultNotAvailableError ||
+      (e instanceof Error && /\(404\)$/.test(e.message))
+    ) {
+      throw new Error(storageNotAvailableMessage());
+    }
+
+    throw e;
+  }
+}
+
+async function api<T>(
+  path: string,
+  init?: RequestInit & { body?: string },
+): Promise<T> {
+  const response = await managedFetch(`${path}`, {
+    ...init,
+    headers: init?.body
+      ? { 'Content-Type': 'application/json', ...(init?.headers ?? {}) }
+      : init?.headers,
+  });
+
+  if (response.status === 401) throw new VaultSessionEndedError();
+
+  if (!response.ok) {
+    // The control plane answers 402 when a plan does not cover this, and the
+    // body carries an upgrade URL. Surfacing the server's own message beats a
+    // generic failure, which is what a user would otherwise see for a billing
+    // problem.
+    const body = await response.json().catch(() => null);
+    throw new Error(
+      body?.error ?? `Cloud Vault request failed (${response.status})`,
+    );
+  }
+
+  // A control plane that does not have this route yet can answer with its
+  // HTML app shell and a 200. Never let a parse error reach a person.
+  try {
+    return (await response.json()) as T;
+  } catch {
+    throw new VaultNotAvailableError();
+  }
+}
+
+export async function enrollVault(
+  driveSubject: string,
+  agentSubject: string,
+  metadata?: { name?: string; emoji?: string },
+  signal?: AbortSignal,
+): Promise<VaultEnrollment> {
+  const created = await api<{ enrollment: VaultEnrollment }>(
+    '/cloud-vault/enroll',
+    {
+      signal,
+      method: 'POST',
+      body: JSON.stringify({
+        drive_subject: driveSubject,
+        agent_subject: agentSubject,
+        drive_name: metadata?.name,
+        drive_emoji: metadata?.emoji,
+      }),
+    },
+  );
+
+  return created.enrollment;
+}
+
+export async function listVaultDrives(): Promise<VaultEnrollment[]> {
+  return api<VaultEnrollment[]>('/cloud-vault/drives');
+}
+
+/**
+ * What any signed-in account may learn about a drive's backup, including one
+ * that another account pays for. The members' view of a vault they do not own:
+ * that it exists and who made it, never how to manage it.
+ */
+export type VaultDriveSummary =
+  | { enabled: false }
+  | {
+      enabled: true;
+      is_yours: boolean;
+      suspended: boolean;
+      last_backup_at: number | null;
+      /** The payer's chosen display name; null when they set none. */
+      backed_up_by: string | null;
+    };
+
+export async function getVaultDriveSummary(
+  driveSubject: string,
+): Promise<VaultDriveSummary> {
+  return api<VaultDriveSummary>(
+    `/cloud-vault/drive-status?${new URLSearchParams({ drive: driveSubject })}`,
+  );
+}
+
+export async function disableVault(drivePseudonym: string): Promise<void> {
+  await api(`/cloud-vault/${drivePseudonym}/disable`, {
+    method: 'POST',
+    body: '{}',
+  });
+}
+
+/**
+ * Store this drive's wrapped vault key.
+ *
+ * The envelope is sealed under the account's agent secret, which never leaves
+ * the browser — the control plane holds ciphertext it cannot open, the same
+ * boundary as the recovery-secret blob. Storing it is what makes a wiped device
+ * recoverable, and it is why enabling backup asks the user to remember nothing.
+ */
+export async function putVaultKeyEnvelope(
+  drivePseudonym: string,
+  envelope: string,
+  { replace = false, signal }: { replace?: boolean; signal?: AbortSignal } = {},
+): Promise<void> {
+  await api(`/cloud-vault/${drivePseudonym}/key`, {
+    signal,
+    method: 'PUT',
+    body: JSON.stringify({ envelope, replace }),
+  });
+}
+
+/** A drive key in hand, and the epoch its envelope wrapped it at. */
+export type DriveKeyHandle = {
+  driveKey: Uint8Array;
+  /**
+   * The drive's key epoch when this key was unwrapped. Compared with the
+   * epoch the drive reports before every upload: a mismatch means someone
+   * re-keyed, and this key must not seal anything new.
+   */
+  keyEpoch: number;
+};
+
+/**
+ * The stored envelope together with the epoch it wraps. `key_epoch` is
+ * optional on the wire only for a control plane predating epoch tracking; it
+ * reads as 1, the epoch every drive started at.
+ */
+export async function getVaultKeyEnvelopeRecord(
+  drivePseudonym: string,
+  signal?: AbortSignal,
+): Promise<{ envelope: string; keyEpoch: number } | null> {
+  signal?.throwIfAborted();
+  const response = await managedFetch(`/cloud-vault/${drivePseudonym}/key`, {
+    signal,
+    credentials: 'include',
+  });
+
+  if (response.status === 204) return null;
+
+  // Same as `api`: a session that ended mid-pass (sign-out in another tab) is
+  // not a failed backup, and callers skip quietly on this error.
+  if (response.status === 401) throw new VaultSessionEndedError();
+
+  if (!response.ok) {
+    const body = await response.json().catch(() => null);
+    throw new Error(
+      body?.error ?? `Could not fetch the vault key (${response.status})`,
+    );
+  }
+
+  const record = (await response.json()) as {
+    envelope?: unknown;
+    key_epoch?: unknown;
+  };
+
+  // A present-but-unusable envelope must not read as "no key yet": the caller
+  // would mint a second key and overwrite the real one, making every existing
+  // backup permanently undecryptable.
+  if (typeof record.envelope !== 'string' || record.envelope.length === 0) {
+    throw new Error('The stored vault key is malformed.');
+  }
+
+  return {
+    envelope: record.envelope,
+    keyEpoch: typeof record.key_epoch === 'number' ? record.key_epoch : 1,
+  };
+}
+
+/** What `GET /api/cloud-vault/{drive}/state` reports. */
+export type VaultDriveState = {
+  enrollment: VaultEnrollment;
+  /** Device pubkey → last segment number written to that lane. */
+  lanes: Record<string, number>;
+  checkpoints: VaultCheckpoint[];
+  pending_uploads: number;
+  confirmed_objects: number;
+  /**
+   * Confirmed objects still sealed under an epoch before the drive's current
+   * one. Non-zero after a re-key means that much history is still readable
+   * with the old key, until this client re-seals and drops it.
+   */
+  stale_epoch_objects?: number;
+};
+
+/**
+ * The checkpoint number this device should claim next.
+ *
+ * Taken from the server so two devices do not both mint number 1 over an
+ * anchorless vault. They still can — the read and the publish are not atomic —
+ * and `publish_checkpoint` rejects the loser rather than letting two records
+ * claim different coverage over one set of stored bytes.
+ */
+export function nextCheckpointFor(state: VaultDriveState): number {
+  return (
+    state.checkpoints.reduce((max, c) => Math.max(max, c.checkpoint_n), 0) + 1
+  );
+}
+
+/** Read enrollment eligibility without attempting to claim another account's drive. */
+export async function canEnrollVault(
+  driveSubject: string,
+  signal?: AbortSignal,
+): Promise<boolean> {
+  const result = await api<{ can_enroll: boolean }>(
+    '/cloud-vault/eligibility',
+    {
+      method: 'POST',
+      signal,
+      body: JSON.stringify({ drive_subject: driveSubject }),
+    },
+  );
+
+  return result.can_enroll;
+}
+
+export async function getVaultState(
+  drivePseudonym: string,
+  signal?: AbortSignal,
+): Promise<VaultDriveState> {
+  return api<VaultDriveState>(`/cloud-vault/${drivePseudonym}/state`, {
+    signal,
+  });
+}
+
+/** One row of the storage breakdown, from `GET /api/cloud-vault/{drive}/usage`. */
+export type VaultUsageCategory = {
+  kind: string;
+  objects: number;
+  bytes: number;
+};
+
+/**
+ * What a drive's Cloud Vault storage is made of. The host is blind, so this is
+ * by kind of object, never by file or note.
+ */
+export type VaultUsage = {
+  used_bytes: number;
+  quota_bytes: number;
+  by_kind: VaultUsageCategory[];
+  /** Superseded history and unused files; freeing these loses nothing. */
+  reclaimable_bytes: number;
+  reclaimable_objects: number;
+  /** Extra bytes kept only so a recently deleted item can come back. */
+  undo_window_bytes: number;
+  undo_window_objects: number;
+  pending_bytes: number;
+  unaccounted_bytes: number;
+  /**
+   * Where the change packs stand. Optional: older control planes do not send
+   * it. The pack categories below are disjoint.
+   */
+  history?: VaultHistoryUsage;
+  /** Stored snapshots, newest first. Optional: older control planes omit it. */
+  snapshots?: VaultSnapshotUsage[];
+};
+
+/** One stored snapshot. The latest is never deletable. */
+export type VaultSnapshotUsage = {
+  id: string;
+  created_at: number;
+  bytes: number;
+  is_latest: boolean;
+};
+
+export type VaultHistoryUsage = {
+  /** Devices that have written changes to this backup. */
+  lanes: number;
+  pack_objects: number;
+  pack_bytes: number;
+  /** The newest change pack of each device. Never freed. */
+  tip_objects: number;
+  tip_bytes: number;
+  /** Changes no snapshot includes yet; freeable once a snapshot covers them. */
+  uncovered_objects: number;
+  uncovered_bytes: number;
+  /** Covered by a snapshot, kept so recently deleted items can be recovered. */
+  in_undo_window_objects: number;
+  in_undo_window_bytes: number;
+  /** Can be removed right now. */
+  freeable_objects: number;
+  freeable_bytes: number;
+  checkpoint_objects: number;
+  anchor_covers_lanes: number;
+};
+
+export type VaultFreeUpResult = {
+  pruned: number;
+  blobs_pruned: number;
+  bytes_reclaimed: number;
+  delete_failures: number;
+};
+
+export async function getVaultUsage(
+  drivePseudonym: string,
+  signal?: AbortSignal,
+): Promise<VaultUsage> {
+  return storageApi<VaultUsage>(`/cloud-vault/${drivePseudonym}/usage`, {
+    signal,
+  });
+}
+
+/**
+ * Free reclaimable storage now. `includeUndoWindow` also gives up the chance to
+ * bring back recently deleted items, so it is only ever passed when the person
+ * chose that.
+ */
+export async function freeUpVaultStorage(
+  drivePseudonym: string,
+  includeUndoWindow: boolean,
+): Promise<VaultFreeUpResult> {
+  return storageApi<VaultFreeUpResult>(
+    `/cloud-vault/${drivePseudonym}/free-up`,
+    {
+      method: 'POST',
+      body: JSON.stringify({ include_undo_window: includeUndoWindow }),
+    },
+  );
+}
+
+/** Delete one older snapshot. The control plane refuses the latest. */
+export async function deleteVaultSnapshot(
+  drivePseudonym: string,
+  snapshotId: string,
+): Promise<VaultFreeUpResult> {
+  return storageApi<VaultFreeUpResult>(
+    `/cloud-vault/${drivePseudonym}/snapshots/${encodeURIComponent(snapshotId)}/delete`,
+    { method: 'POST' },
+  );
+}
+
+/** What {@link compactVaultBackup} did, for the screen to report. */
+export type CompactResult = {
+  freed: VaultFreeUpResult;
+  /** Bytes of the checkpoint written first, so the net gain can be shown. */
+  checkpointBytes: number;
+};
+
+/**
+ * Collapse the backup's change chain into one fresh checkpoint, then free what
+ * that checkpoint made redundant.
+ *
+ * The order is the safety property. The control plane only prunes a delta once
+ * a *published* checkpoint covers it, and this device only calls free-up after
+ * its own checkpoint pass finished, so a failure at any step leaves the old
+ * chain intact. In particular, if the checkpoint does not happen, free-up is
+ * never called: freeing against an older anchor would still be safe, but
+ * "compress" would then report success while doing none of what was asked.
+ *
+ * `includeUndoWindow` is the irreversible variant; it must only be passed after
+ * the person confirmed it, and it also makes the new checkpoint a shallow one:
+ * the backup keeps each item's current state and none of its edit history.
+ * Devices keep the history they hold. Plain compression keeps the history.
+ * This touches the backup only, never the live drive.
+ */
+export async function compactVaultBackup({
+  runBackup,
+  drivePseudonym,
+  includeUndoWindow,
+}: {
+  /**
+   * Runs one backup pass with `forceCheckpoint: true`, and with
+   * `currentStateOnly` as given.
+   */
+  runBackup: (options: { currentStateOnly: boolean }) => Promise<BackupOutcome>;
+  drivePseudonym: string;
+  includeUndoWindow: boolean;
+}): Promise<CompactResult> {
+  const outcome = await runBackup({ currentStateOnly: includeUndoWindow });
+
+  if (outcome.status !== 'backed-up' || outcome.kind !== 'checkpoint') {
+    throw new Error(
+      'The backup could not be compressed right now, so nothing was removed.',
+    );
+  }
+
+  const freed = await freeUpVaultStorage(drivePseudonym, includeUndoWindow);
+
+  return { freed, checkpointBytes: outcome.bytes };
+}
+
+/**
+ * The segment number this device should write next.
+ *
+ * Taken from the server's lane state rather than anything local: a device that
+ * cleared its storage has no memory of what it wrote, and reusing a segment
+ * number would overwrite a pack that is still the only copy of some history.
+ */
+export function nextSegmentFor(
+  state: VaultDriveState,
+  devicePubkey: string,
+): number {
+  return (state.lanes[devicePubkey] ?? 0) + 1;
+}
+
+export async function listVaultObjects(
+  drivePseudonym: string,
+): Promise<VaultObject[]> {
+  return api<VaultObject[]>(`/cloud-vault/${drivePseudonym}/objects`);
+}
+
+/**
+ * Back a drive up: seal locally, upload straight to storage, then tell the
+ * control plane what landed.
+ *
+ * The order matters. The object is confirmed only *after* storage accepted it,
+ * so a failed upload leaves a reservation that expires rather than usage the
+ * user never consumed. Confirming first would make quota drift upward on every
+ * dropped connection.
+ *
+ * The pass may produce either an incremental **pack** or a **checkpoint**, and
+ * `vaultExport` decides which — the cadence lives in Rust so every host makes
+ * the same call. A checkpoint takes one extra step: it is *published* after it
+ * is confirmed, which is what tells the control plane it may prune the chain
+ * the anchor now subsumes. Uploading one without publishing it stores bytes
+ * that free nothing.
+ */
+export async function backupDrive({
+  db,
+  signal,
+  driveSubject,
+  drivePseudonym,
+  devicePubkey,
+  driveKey,
+  keyEpoch = 1,
+  segment,
+  checkpointN,
+  driveHasCheckpoint,
+  forceCheckpoint = false,
+  currentStateOnly = false,
+  observedLanes,
+  collisionRetries = 0,
+  beforeNetworkWrite,
+}: {
+  db: VaultCapableDb;
+  collisionRetries?: number;
+  beforeNetworkWrite?: () => Promise<void>;
+  signal?: AbortSignal;
+  driveSubject: string;
+  drivePseudonym: string;
+  devicePubkey: string;
+  driveKey: Uint8Array;
+  keyEpoch?: number;
+  segment: number;
+  checkpointN: number;
+  driveHasCheckpoint: boolean;
+  /**
+   * Make this pass a full checkpoint even though the vault already has an
+   * anchor. Done by telling the exporter there is none, which is the one input
+   * it already treats as "this pass must be an anchor": the cursors, lane
+   * state and coverage logic all run unchanged, so nothing here needs its own
+   * path.
+   */
+  forceCheckpoint?: boolean;
+  /**
+   * With a checkpoint, drop the edit history and keep only the current state
+   * ("Discard history"). Deltas are unaffected: they carry just the new ops.
+   */
+  currentStateOnly?: boolean;
+  observedLanes: Record<string, number>;
+}): Promise<BackupOutcome> {
+  signal?.throwIfAborted();
+  const sealedPack = await db.vaultExport(
+    driveSubject,
+    driveKey,
+    keyEpoch,
+    drivePseudonym,
+    devicePubkey,
+    segment,
+    checkpointN,
+    driveHasCheckpoint && !forceCheckpoint,
+    observedLanes,
+    currentStateOnly,
+  );
+
+  signal?.throwIfAborted();
+  // An untouched drive produces nothing. Since incremental cursors landed this
+  // is the ordinary outcome for an idle device rather than a rare one: a pass
+  // whose version vectors all match the lane cursor writes no object at all.
+  if (!sealedPack) return { status: 'nothing-to-do' };
+
+  const isCheckpoint = sealedPack.kind === 'checkpoint';
+
+  await beforeNetworkWrite?.();
+  signal?.throwIfAborted();
+  const { uploads } = await api<{ uploads: UploadUrl[] }>(
+    `/cloud-vault/${drivePseudonym}/upload-urls`,
+    {
+      method: 'POST',
+      signal,
+      body: JSON.stringify({
+        objects: [
+          isCheckpoint
+            ? {
+                kind: 'checkpoint',
+                size_bytes: sealedPack.sealed.length,
+                key_epoch: keyEpoch,
+                checkpoint_n: checkpointN,
+              }
+            : {
+                kind: 'pack',
+                size_bytes: sealedPack.sealed.length,
+                key_epoch: keyEpoch,
+                lane_device_pubkey: devicePubkey,
+                segment,
+              },
+        ],
+      }),
+    },
+  );
+
+  const upload = uploads?.[0];
+
+  if (!upload) {
+    throw new Error('The control plane issued no upload URL for this object.');
+  }
+
+  // The server decides where an object lives; the client never picks its own
+  // location. A mismatch means the two sides disagree about the key layout,
+  // which would otherwise only surface as a restore that comes up short.
+  if (upload.object_key !== sealedPack.objectKey) {
+    throw new Error(
+      `Vault key mismatch: control plane issued ${upload.object_key}, client sealed ${sealedPack.objectKey}`,
+    );
+  }
+
+  if (upload.already_stored) {
+    // A cancelled pass may have confirmed bytes without publishing its anchor.
+    // Those bytes need not match this export. Never overwrite them, publish
+    // this export's coverage over them, or advance this export's cursor.
+    if (collisionRetries >= 8) {
+      throw new Error(
+        'Vault backup could not reserve a fresh object after 8 collisions.',
+      );
+    }
+
+    return backupDrive({
+      db,
+      signal,
+      driveSubject,
+      drivePseudonym,
+      devicePubkey,
+      driveKey,
+      keyEpoch,
+      driveHasCheckpoint,
+      forceCheckpoint,
+      currentStateOnly,
+      observedLanes,
+      checkpointN: isCheckpoint ? checkpointN + 1 : checkpointN,
+      segment: isCheckpoint ? segment : segment + 1,
+      collisionRetries: collisionRetries + 1,
+      beforeNetworkWrite,
+    });
+  }
+
+  // Guard the type rather than assert it. `fetch` accepts any value as `body`
+  // and stringifies whatever it does not recognise, so a plain number array —
+  // which is what `serde_wasm_bindgen` produces for a `Vec<u8>` unless the
+  // boundary is explicit — uploads as the text "1,1,0,0,..." instead of
+  // ciphertext. That stores fine, counts fine, and is unrestorable: exactly
+  // the kind of success this vault must never report.
+  if (!(sealedPack.sealed instanceof Uint8Array)) {
+    throw new Error(
+      'Vault export returned non-binary data; refusing to upload a corrupt object.',
+    );
+  }
+
+  const put = await fetch(upload.url, {
+    method: 'PUT',
+    signal,
+    body: sealedPack.sealed as BodyInit,
+    headers: Object.fromEntries(
+      // Content-Length is set by the browser and cannot be assigned; passing it
+      // through would throw before the request is made.
+      upload.headers.filter(
+        ([name]) => name.toLowerCase() !== 'content-length',
+      ),
+    ),
+  });
+
+  if (!put.ok) {
+    throw new Error(`Vault upload failed (${put.status})`);
+  }
+
+  await beforeNetworkWrite?.();
+  signal?.throwIfAborted();
+  await api(`/cloud-vault/${drivePseudonym}/confirm-upload`, {
+    method: 'POST',
+    signal,
+    body: JSON.stringify({
+      confirmations: [
+        { object_id: upload.object_id, size_bytes: sealedPack.sealed.length },
+      ],
+    }),
+  });
+
+  // Publishing is what makes a checkpoint an anchor. Until this lands the
+  // control plane has bytes it cannot prune against, so a checkpoint that
+  // uploaded and never published costs storage and frees none.
+  //
+  // A rejection here means another device published this number first. Its
+  // anchor is just as good as ours, so the pass still counts as backed up and
+  // the next one picks the next number.
+  if (isCheckpoint) {
+    try {
+      await beforeNetworkWrite?.();
+      signal?.throwIfAborted();
+      await api(`/cloud-vault/${drivePseudonym}/checkpoint`, {
+        method: 'POST',
+        signal,
+        body: JSON.stringify({
+          checkpoint_n: checkpointN,
+          coverage: sealedPack.coverage,
+          checkpoint_object_id: upload.object_id,
+        }),
+      });
+    } catch (error) {
+      if (error instanceof VaultSessionEndedError) throw error;
+      signal?.throwIfAborted();
+      console.warn(
+        `Vault checkpoint ${checkpointN} was not published; another device likely won the race.`,
+        error,
+      );
+    }
+  }
+
+  // Only now is the lane's progress official. Sealing parked it; if the upload
+  // above had failed, the next pass would retry against the same view of what
+  // has been backed up rather than one that assumed success. That matters more
+  // than it did before cursors existed: an advanced cursor whose object never
+  // landed leaves ops no later delta would ever ship again.
+  signal?.throwIfAborted();
+  await db.vaultCommitSegment(drivePseudonym, devicePubkey, segment);
+
+  return {
+    status: 'backed-up',
+    kind: sealedPack.kind,
+    resources: sealedPack.resources,
+    unchanged: sealedPack.unchanged,
+    bytes: sealedPack.sealed.length,
+    objectKey: sealedPack.objectKey,
+  };
+}
+
+/** Matches `MAX_URL_BATCH` in the control plane's vault API. */
+const DOWNLOAD_URL_BATCH = 64;
+
+/** One sealed object as the importer takes it. */
+export type SealedObject = { objectKey: string; sealed: Uint8Array };
+
+/**
+ * Where restore reads its sealed objects from: the cloud vault, or a backup
+ * file on this device. It must return them in the order they are to be applied.
+ */
+export type RestoreSource = (
+  onProgress?: (done: number, total: number) => void,
+) => Promise<SealedObject[]>;
+
+/**
+ * Download every listed object's body, at most four at a time, in listing order.
+ *
+ * `read` decides what a body becomes: bytes for a restore, a `Blob` for a
+ * backup file (the browser may keep those on disk rather than in memory).
+ */
+export async function downloadVaultObjects<T>(
+  drivePseudonym: string,
+  objects: VaultObject[],
+  read: (response: Response) => Promise<T>,
+  onProgress?: (done: number, total: number) => void,
+): Promise<T[]> {
+  if (objects.length === 0) return [];
+
+  // The control plane signs at most DOWNLOAD_URL_BATCH objects per request,
+  // and a drive with a longer history refused to restore at all.
+  const downloads: DownloadUrl[] = [];
+
+  for (let i = 0; i < objects.length; i += DOWNLOAD_URL_BATCH) {
+    const batch = objects.slice(i, i + DOWNLOAD_URL_BATCH);
+    const answer = await api<{ downloads: DownloadUrl[] }>(
+      `/cloud-vault/${drivePseudonym}/download-urls`,
+      {
+        method: 'POST',
+        body: JSON.stringify({ object_ids: batch.map(o => o.object_id) }),
+      },
+    );
+    downloads.push(...answer.downloads);
+  }
+
+  // Preserve the server's ordering: `download-urls` answers per request and is
+  // not required to echo the order back.
+  const urlByKey = new Map(downloads.map(d => [d.object_key, d.url]));
+  const fetched = new Array<T>(objects.length);
+  let next = 0;
+  let completed = 0;
+  let failed = false;
+
+  // Hide per-object network latency without opening unbounded requests on a
+  // phone. Write by listing index, never completion order.
+  await Promise.all(
+    Array.from({ length: Math.min(4, objects.length) }, async () => {
+      while (!failed && next < objects.length) {
+        const index = next++;
+        const object = objects[index];
+
+        try {
+          const url = urlByKey.get(object.object_key);
+          if (!url)
+            throw new Error(`No download URL issued for ${object.object_key}`);
+          const response = await fetch(url);
+
+          if (!response.ok) {
+            throw new Error(
+              `Vault download failed for ${object.object_key} (${response.status})`,
+            );
+          }
+
+          fetched[index] = await read(response);
+          completed++;
+          if (!failed) onProgress?.(completed, objects.length);
+        } catch (error) {
+          failed = true;
+          throw error;
+        }
+      }
+    }),
+  );
+
+  return fetched;
+}
+
+/** The cloud vault as a {@link RestoreSource}. */
+export function cloudRestoreSource(drivePseudonym: string): RestoreSource {
+  return async onProgress => {
+    const objects = await listVaultObjects(drivePseudonym);
+
+    const bodies = await downloadVaultObjects(
+      drivePseudonym,
+      objects,
+      async response => new Uint8Array(await response.arrayBuffer()),
+      onProgress,
+    );
+
+    return objects.map((object, i) => ({
+      objectKey: object.object_key,
+      sealed: bodies[i],
+    }));
+  };
+}
+
+/**
+ * Restore a drive from its vault into this device's store.
+ *
+ * Objects are listed from the control plane rather than guessed: keys are
+ * reconstructible from the format, but the ids `download-urls` needs are not,
+ * so a device that lost its local state can only learn them by asking.
+ *
+ * The list arrives ordered by key and is applied in that order. Out of order, a
+ * later segment's deletion would be applied before the earlier pack that
+ * re-creates the resource, and the delete would be undone.
+ *
+ * `source` replaces the cloud vault, e.g. with a backup file; whatever it
+ * returns goes through exactly the same import.
+ */
+export async function restoreDrive({
+  db,
+  drivePseudonym,
+  devicePubkey,
+  driveKey,
+  keyEpoch = 1,
+  onProgress,
+  source = cloudRestoreSource(drivePseudonym),
+}: {
+  db: VaultCapableDb;
+  drivePseudonym: string;
+  devicePubkey: string;
+  driveKey: Uint8Array;
+  keyEpoch?: number;
+  onProgress?: (downloaded: number, total: number) => void;
+  source?: RestoreSource;
+}): Promise<RestoreOutcome> {
+  const fetched = await source(onProgress);
+
+  if (fetched.length === 0) {
+    return {
+      packsRead: 0,
+      resourcesRestored: 0,
+      tombstonesApplied: 0,
+      objectsSkipped: 0,
+      objectsUnreadable: 0,
+    };
+  }
+
+  // Every lane, not just this device's: each device appends only to its own,
+  // so importing one would silently drop the rest of the drive's history.
+  //
+  // The order this list arrives in is not the order it is applied in. The
+  // importer reads the newest checkpoint first, then uses its coverage and
+  // observed maps to decide what to replay and when — see `plan_restore` in
+  // `lib/src/vault/sync.rs`. Passing everything and letting it choose is what
+  // keeps that decision in one place rather than duplicated here in JS.
+  return db.vaultImport(
+    driveKey,
+    keyEpoch,
+    drivePseudonym,
+    devicePubkey,
+    fetched,
+  );
+}
+
+/** The part of a wasm `ClientDb` needed to read one snapshot. */
+export type ScratchVaultDb = {
+  vaultImport: VaultCapableDb['vaultImport'];
+  allSubjects(): string[] | Promise<string[]>;
+  getLoroSnapshot(
+    subject: string,
+  ): Uint8Array | null | Promise<Uint8Array | null>;
+  free?(): void;
+};
+
+/**
+ * Every resource of one snapshot as it was then: subject → Loro snapshot bytes.
+ *
+ * A snapshot id is the id of a checkpoint record, listed by the usage route and
+ * also carried by `state.checkpoints[].id`. That record names the checkpoint
+ * object (`checkpoint_object_id`, key `.../checkpoints/ckpt-N.loro`). A
+ * checkpoint holds every resource's whole oplog at that moment, so the object
+ * alone is the exact state; the change packs around it are newer or older
+ * history and are deliberately not read. It is opened in a scratch store, never
+ * in the live one, because importing only merges and the newer edits would stay.
+ */
+export async function readVaultSnapshot({
+  drivePseudonym,
+  snapshotId,
+  driveKey,
+  keyEpoch,
+  devicePubkey,
+  openScratchDb,
+  onProgress,
+}: {
+  drivePseudonym: string;
+  snapshotId: string;
+  driveKey: Uint8Array;
+  keyEpoch: number;
+  devicePubkey: string;
+  openScratchDb: () => Promise<ScratchVaultDb>;
+  onProgress?: (done: number, total: number) => void;
+}): Promise<{ state: Map<string, Uint8Array>; sealed: SealedObject }> {
+  const vaultState = await getVaultState(drivePseudonym);
+  const checkpoint = vaultState.checkpoints.find(c => c.id === snapshotId);
+
+  if (!checkpoint) {
+    throw new Error('This snapshot is no longer stored. Choose another one.');
+  }
+
+  const object = (await listVaultObjects(drivePseudonym)).find(
+    o => o.object_id === checkpoint.checkpoint_object_id,
+  );
+
+  if (!object) {
+    throw new Error('This snapshot is no longer stored. Choose another one.');
+  }
+
+  const [body] = await downloadVaultObjects(
+    drivePseudonym,
+    [object],
+    async response => new Uint8Array(await response.arrayBuffer()),
+    onProgress,
+  );
+  const sealed = { objectKey: object.object_key, sealed: body };
+  const scratch = await openScratchDb();
+
+  try {
+    // A fresh store already holds the built-in vocabulary; only what the
+    // checkpoint adds is the drive.
+    const builtIn = new Set(await scratch.allSubjects());
+    const summary = await scratch.vaultImport(
+      driveKey,
+      keyEpoch,
+      drivePseudonym,
+      devicePubkey,
+      [sealed],
+    );
+
+    if (summary.packsRead !== 1 || summary.objectsUnreadable > 0) {
+      throw new Error('This snapshot could not be opened.');
+    }
+
+    const state = new Map<string, Uint8Array>();
+
+    for (const subject of await scratch.allSubjects()) {
+      if (builtIn.has(subject)) continue;
+
+      const bytes = await scratch.getLoroSnapshot(subject);
+
+      if (bytes) state.set(subject, bytes);
+    }
+
+    return { state, sealed };
+  } finally {
+    scratch.free?.();
+  }
+}
+
+/**
+ * The key-management half of the client.
+ *
+ * Kept separate from the transport above because it is where the "no second
+ * secret" promise is actually kept: a drive key is generated once, wrapped
+ * under the agent secret, and handed to the control plane as ciphertext. From
+ * then on any device that can sign in as this account can get it back.
+ */
+export type VaultKeyOps = {
+  /**
+   * A throw-away in-memory store, to read a snapshot without touching the
+   * drive on this device. Absent where the wasm bundle is not loaded.
+   */
+  openScratchDb?: () => Promise<ScratchVaultDb>;
+  vaultGenerateKey(): Uint8Array;
+  vaultWrapKey(driveKey: Uint8Array, agentSecret: Uint8Array): string;
+  vaultUnwrapKey(envelope: string, agentSecret: Uint8Array): Uint8Array;
+};
+
+/**
+ * Turn Cloud Vault on for a drive and make sure its key is recoverable.
+ *
+ * Enrolls, then generates and stores a wrapped key — but only if the drive does
+ * not already have one. Re-running on a drive that is already set up returns
+ * the existing key rather than minting a new one: a second key would leave
+ * every object written under the first permanently unreadable, which is the
+ * worst thing this module could do.
+ */
+export async function setUpVaultForDrive({
+  keys,
+  driveSubject,
+  agentSubject,
+  agentSecret,
+  metadata,
+  signal,
+}: {
+  signal?: AbortSignal;
+  metadata?: { name?: string; emoji?: string };
+  keys: VaultKeyOps;
+  driveSubject: string;
+  agentSubject: string;
+  agentSecret: Uint8Array;
+}): Promise<{ enrollment: VaultEnrollment } & DriveKeyHandle> {
+  signal?.throwIfAborted();
+  const enrollment = await enrollVault(
+    driveSubject,
+    agentSubject,
+    metadata,
+    signal,
+  );
+  const existing = await getVaultKeyEnvelopeRecord(
+    enrollment.drive_pseudonym,
+    signal,
+  );
+
+  signal?.throwIfAborted();
+
+  if (existing) {
+    return {
+      enrollment,
+      driveKey: keys.vaultUnwrapKey(existing.envelope, agentSecret),
+      keyEpoch: existing.keyEpoch,
+    };
+  }
+
+  const driveKey = keys.vaultGenerateKey();
+
+  try {
+    // Stored before anything is backed up. A key that exists only in memory
+    // when the first upload happens would leave objects nobody can open if the
+    // tab closed in between.
+    await putVaultKeyEnvelope(
+      enrollment.drive_pseudonym,
+      keys.vaultWrapKey(driveKey, agentSecret),
+      { signal },
+    );
+  } catch {
+    signal?.throwIfAborted();
+    // Create-only, so this means another client won the race and stored its
+    // own key between our read and our write. Theirs is authoritative: adopting
+    // it is the only outcome where both clients can read each other's backups.
+    // Ours has sealed nothing yet, so discarding it costs nothing.
+    const winner = await getVaultKeyEnvelopeRecord(
+      enrollment.drive_pseudonym,
+      signal,
+    );
+
+    if (!winner) throw new Error('Could not store or recover a vault key.');
+
+    return {
+      enrollment,
+      driveKey: keys.vaultUnwrapKey(winner.envelope, agentSecret),
+      keyEpoch: winner.keyEpoch,
+    };
+  }
+
+  return { enrollment, driveKey, keyEpoch: enrollment.key_epoch ?? 1 };
+}
+
+/**
+ * Recover a drive's key on a device that has none.
+ *
+ * This is the step that makes "clear site data, sign in, restore" work: the
+ * envelope comes from the control plane, the agent secret comes from signing
+ * in, and neither alone is enough.
+ */
+export async function recoverDriveKey({
+  keys,
+  drivePseudonym,
+  agentSecret,
+}: {
+  keys: VaultKeyOps;
+  drivePseudonym: string;
+  agentSecret: Uint8Array;
+}): Promise<DriveKeyHandle> {
+  const record = await getVaultKeyEnvelopeRecord(drivePseudonym);
+
+  if (!record) {
+    throw new Error(
+      'This drive has no stored vault key, so its backups cannot be decrypted.',
+    );
+  }
+
+  return {
+    driveKey: keys.vaultUnwrapKey(record.envelope, agentSecret),
+    keyEpoch: record.keyEpoch,
+  };
+}
+
+/**
+ * Run one backup pass for a drive.
+ *
+ * Picks the segment from the server's lane state, so a device that lost its
+ * local storage does not overwrite a pack that is still the only copy of some
+ * history.
+ *
+ * **Single-flight per drive.** Two passes running at once would both read the
+ * same "next" segment and race to write it, and the loser's history would be
+ * silently overwritten. Concurrent callers share the in-flight promise instead
+ * of starting a second pass.
+ *
+ * That guard is per JavaScript context, which is enough only because exactly
+ * one context is meant to run this. The ClientDb worker is that context — a
+ * SharedWorker fans every tab into one inner worker, so the store has a single
+ * writer. Driving backups from individual tabs instead would reintroduce the
+ * race across tabs, where an in-process lock cannot see it.
+ */
+const inFlight = new Map<string, Promise<BackupOutcome>>();
+
+export function runVaultBackup(args: {
+  /** Revalidate the account after encryption or storage I/O. */
+  beforeNetworkWrite?: () => Promise<void>;
+  signal?: AbortSignal;
+  db: VaultCapableDb;
+  driveSubject: string;
+  drivePseudonym: string;
+  devicePubkey: string;
+  driveKey: Uint8Array;
+  /**
+   * The epoch `driveKey` was unwrapped at. Read as 1 when absent: a drive
+   * that was never re-keyed has only ever had epoch 1.
+   */
+  driveKeyEpoch?: number;
+  /**
+   * Fetch and unwrap the drive's current envelope. Called when the drive
+   * reports an epoch other than `driveKeyEpoch`, which means someone re-keyed
+   * since this key was obtained. Without it a re-keyed drive cannot be backed
+   * up from here: sealing with the old key while declaring the new epoch
+   * would pass the server's check and produce objects the new key cannot
+   * read, which is the exact hole the epoch exists to close.
+   */
+  refreshDriveKey?: () => Promise<DriveKeyHandle>;
+  /** Force this pass to be a full checkpoint. See {@link backupDrive}. */
+  forceCheckpoint?: boolean;
+  /** Make that checkpoint keep only the current state. See {@link backupDrive}. */
+  currentStateOnly?: boolean;
+}): Promise<BackupOutcome> {
+  const existing = inFlight.get(args.drivePseudonym);
+
+  if (existing) {
+    if (!args.forceCheckpoint) return existing;
+
+    // Joining a pass that is only a delta would hand back something other
+    // than the checkpoint that was asked for. Wait for it, then run our own.
+    return existing.then(
+      () => runVaultBackup(args),
+      () => runVaultBackup(args),
+    );
+  }
+
+  const pass = (async () => {
+    args.signal?.throwIfAborted();
+    await args.beforeNetworkWrite?.();
+    const state = await getVaultState(args.drivePseudonym, args.signal);
+    args.signal?.throwIfAborted();
+
+    // A suspended vault refuses uploads; asking anyway would just produce an
+    // error per tick and bury anything else in the log.
+    if (state.enrollment.status !== 'active') {
+      return { status: 'nothing-to-do' } as BackupOutcome;
+    }
+
+    // The epoch comes from the state just read, never from the caller. The
+    // key has to match it: a long-lived caller holding the key it started
+    // with is exactly the client that would keep sealing under a key someone
+    // was just removed from.
+    const currentEpoch = state.enrollment.key_epoch ?? 1;
+    let { driveKey } = args;
+    let heldEpoch = args.driveKeyEpoch ?? 1;
+
+    if (heldEpoch !== currentEpoch) {
+      if (!args.refreshDriveKey) {
+        throw new Error(
+          `This drive was re-keyed (epoch ${currentEpoch}, key in hand is epoch ${heldEpoch}); fetch the current key envelope before backing up.`,
+        );
+      }
+
+      ({ driveKey, keyEpoch: heldEpoch } = await args.refreshDriveKey());
+
+      if (heldEpoch !== currentEpoch) {
+        throw new Error(
+          `The stored key envelope wraps epoch ${heldEpoch} but the drive is at epoch ${currentEpoch}; the re-key did not finish, so nothing can be sealed safely.`,
+        );
+      }
+    }
+
+    return backupDrive({
+      ...args,
+      driveKey,
+      keyEpoch: currentEpoch,
+      segment: nextSegmentFor(state, args.devicePubkey),
+      checkpointN: nextCheckpointFor(state),
+      driveHasCheckpoint: state.checkpoints.length > 0,
+      // What the vault held when this pass started. A checkpoint records it so
+      // a restore can tell which segments predate the anchor and must be
+      // replayed before it.
+      observedLanes: state.lanes,
+    });
+  })().finally(() => {
+    inFlight.delete(args.drivePseudonym);
+  });
+
+  inFlight.set(args.drivePseudonym, pass);
+
+  return pass;
+}

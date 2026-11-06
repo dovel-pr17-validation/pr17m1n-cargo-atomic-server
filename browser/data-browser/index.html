@@ -1,0 +1,397 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta
+      name="viewport"
+      content="width=device-width, initial-scale=1.0, viewport-fit=cover, interactive-widget=resizes-content"
+    />
+    <meta
+      content="__APP_DESCRIPTION__"
+      name="description"
+    />
+    <link href="/app_data/images/icon.png?v=place-trail-1" rel="icon" type="image/png" />
+    <link
+      href="/app_data/images/apple-touch-icon.png?v=place-trail-1"
+      rel="apple-touch-icon"
+      sizes="180x180"
+    />
+    <link
+      href="/app_data/images/favicon-32x32.png?v=place-trail-1"
+      rel="icon"
+      sizes="32x32"
+      type="image/png"
+    />
+    <link
+      href="/app_data/images/favicon-16x16.png?v=place-trail-1"
+      rel="icon"
+      sizes="16x16"
+      type="image/png"
+    />
+    <link
+      color="#1e43a3"
+      href="/app_data/images/mask-icon.svg?v=place-trail-1"
+      rel="mask-icon"
+    />
+    <meta content="yes" name="apple-mobile-web-app-capable" />
+    <meta content="yes" name="mobile-web-app-capable" />
+    <!-- OS/browser chrome color (titlebar of installed PWAs, mobile UI).
+         Overrides the manifest's single theme_color per color scheme. -->
+    <meta
+      name="theme-color"
+      media="(prefers-color-scheme: light)"
+      content="#ffffff"
+    />
+    <meta
+      name="theme-color"
+      media="(prefers-color-scheme: dark)"
+      content="#000000"
+    />
+    <!-- A reload can cancel the requests for the app's own script (seen with the
+         service worker answering them: ERR_ABORTED on the entry script, a few
+         times in a hundred reloads). Nothing then runs, and the splash would
+         stay for good. Ask for the page once more. The timestamp keeps a page
+         that really cannot load from reloading in a loop. -->
+    <script>
+      window.addEventListener(
+        'error',
+        function (event) {
+          var script = event.target;
+          if (!script || script.tagName !== 'SCRIPT' || script.type !== 'module') {
+            return;
+          }
+          try {
+            var last = Number(sessionStorage.getItem('atomic.bootRetryAt'));
+            if (last && Date.now() - last < 30000) return;
+            sessionStorage.setItem('atomic.bootRetryAt', String(Date.now()));
+          } catch (e) {
+            // Without storage a second failure cannot be told from the first.
+            return;
+          }
+          console.info('[boot] the app script did not load, trying once more');
+          location.reload();
+        },
+        true,
+      );
+    </script>
+    <!-- The local database's WebAssembly is the largest thing a first visit
+         downloads, and the ClientDb worker only asks for it once the app's
+         JavaScript has loaded and the worker has started. Start fetching and
+         compiling it here, in parallel with everything else; the worker
+         instantiates the compiled module it is handed (initClientDb.ts).
+         Skipped where the database is off: Tauri by default, or by choice. -->
+    <script>
+      (function () {
+        try {
+          var disabled = localStorage.getItem('atomic-disable-client-db');
+          var tauri =
+            window.__TAURI_INTERNALS__ ||
+            /^(tauri:|https?:\/\/tauri\.localhost)/.test(location.origin);
+          if (disabled === '1' || (tauri && disabled !== '0')) return;
+          if (!WebAssembly.compileStreaming || !window.isSecureContext) return;
+          var compiled = WebAssembly.compileStreaming(
+            fetch('/wasm/atomic_wasm_bg.wasm?v=__WASM_VERSION__'),
+          );
+          compiled.catch(function () {});
+          window.__atomicWasmModule = compiled;
+        } catch (e) {
+          // The worker fetches it itself.
+        }
+      })();
+    </script>
+    <!-- The signed-in agent is read from IndexedDB (idb-keyval's default
+         database) before the app's JavaScript has loaded; agentStorage.ts
+         takes the result once and reads as before if there is none. The
+         upgrade handler matches idb-keyval's, so opening first can never
+         leave it a database without its store. -->
+    <script>
+      (function () {
+        try {
+          if (!window.indexedDB) return;
+          window.__atomicAgentRead = new Promise(function (resolve) {
+            var req = indexedDB.open('keyval-store');
+            req.onupgradeneeded = function () {
+              req.result.createObjectStore('keyval');
+            };
+            req.onerror = function () {
+              resolve(undefined);
+            };
+            req.onsuccess = function () {
+              var db = req.result;
+              try {
+                var tx = db.transaction('keyval', 'readonly');
+                var store = tx.objectStore('keyval');
+                var agent = store.get('atomic.agent');
+                var fallback = store.get('atomic.agent.fallback');
+                tx.oncomplete = function () {
+                  db.close();
+                  resolve({ agent: agent.result, fallback: fallback.result });
+                };
+                tx.onerror = tx.onabort = function () {
+                  db.close();
+                  resolve(undefined);
+                };
+              } catch (e) {
+                db.close();
+                resolve(undefined);
+              }
+            };
+          });
+        } catch (e) {
+          // agentStorage.ts reads it itself.
+        }
+      })();
+    </script>
+    <link
+      rel="preconnect"
+      crossorigin="anonymous"
+      href="https://atomicdata.dev"
+    />
+    <!-- Custom fonts -->
+    <link
+      rel="preconnect"
+      crossorigin="anonymous"
+      href="https://fonts.googleapis.com"
+    />
+    <link
+      rel="preconnect"
+      crossorigin="anonymous"
+      href="https://fonts.gstatic.com"
+    />
+    <link
+      crossorigin="anonymous"
+      href="https://fonts.googleapis.com/css2?family=Montserrat:wght@700&family=Open+Sans:ital,wght@0,400;0,700;1,400;1,700&display=swap"
+      rel="stylesheet"
+    />
+    <title>__APP_NAME__</title>
+    <style>
+      :root {
+        --text-splash: black;
+        --background-color: white;
+      }
+
+      @media (prefers-color-scheme: dark) {
+        :root {
+          --text-splash: white;
+          --background-color: black;
+        }
+      }
+
+      /* Set by the script below when the in-app dark mode setting overrides
+         the OS preference */
+      :root[data-splash-theme='dark'] {
+        --text-splash: white;
+        --background-color: black;
+      }
+
+      :root[data-splash-theme='light'] {
+        --text-splash: black;
+        --background-color: white;
+      }
+
+      body {
+        background-color: var(--background-color);
+      }
+
+      /* The boot splash: the orbiting mark from atomic.place's hero, alone on
+         the page. It lives outside #root, so React mounting does not remove
+         it: the app decides when it leaves (src/helpers/bootSplash.ts). For
+         most pages that is the first render; the demo keeps it up until its
+         workspace is ready, so the whole setup is this one screen. */
+      #boot-splash {
+        position: fixed;
+        inset: 0;
+        z-index: 2147483000;
+        /* The mark alone is centred, so it sits where the app's own loaders
+           do: the caption hangs below it instead of pushing it up. */
+        display: grid;
+        place-items: center;
+        --boot-mark-size: min(11rem, 36vw);
+        background-color: var(--background-color);
+        color: var(--text-splash);
+        transition:
+          opacity 200ms ease,
+          visibility 0s;
+      }
+
+      #boot-splash.boot-splash-leaving {
+        opacity: 0;
+        visibility: hidden;
+        pointer-events: none;
+        transition:
+          opacity 200ms ease,
+          visibility 0s linear 200ms;
+      }
+
+      /* No scale or slide on the way in or out: the mark stays put from the
+         first paint until the splash has faded away. */
+      .boot-mark {
+        position: relative;
+        width: var(--boot-mark-size);
+        aspect-ratio: 1;
+        --orbit-period: 2.4s;
+      }
+
+      .boot-mark-system,
+      .boot-mark-sweep {
+        position: absolute;
+        inset: 0;
+        width: 100%;
+        height: 100%;
+      }
+
+      .boot-mark-system {
+        animation: boot-mark-spin var(--orbit-period) linear infinite;
+      }
+
+      .boot-mark-orb {
+        position: absolute;
+        left: 50%;
+        top: 50%;
+        width: 24%;
+        height: 24%;
+        translate: -50% -50%;
+        filter: drop-shadow(0 0 18px rgba(0, 194, 255, 0.45));
+        animation: boot-mark-counter-spin var(--orbit-period) linear infinite;
+      }
+
+      /* Said only when it takes a while, so a quick start is just the mark. */
+      .boot-caption {
+        position: absolute;
+        top: calc(50% + var(--boot-mark-size) / 2 + 1.75rem);
+        left: 0;
+        right: 0;
+        padding: 0 1rem;
+        text-align: center;
+        margin: 0;
+        font:
+          400 0.95rem/1.4 'Open Sans',
+          'Helvetica Neue',
+          sans-serif;
+        opacity: 0;
+        color: var(--text-splash);
+        animation: boot-caption-in 600ms ease 1.6s forwards;
+      }
+
+      @keyframes boot-caption-in {
+        to {
+          opacity: 0.55;
+        }
+      }
+
+      @keyframes boot-mark-spin {
+        to {
+          rotate: 360deg;
+        }
+      }
+
+      @keyframes boot-mark-counter-spin {
+        to {
+          rotate: -360deg;
+        }
+      }
+
+      /* A still spinner reads as "hung" rather than "working", so slow it
+         down instead of stopping it. */
+      @media (prefers-reduced-motion: reduce) {
+        .boot-mark {
+          --orbit-period: 6s;
+        }
+      }
+    </style>
+    <!-- Meta tags and code added by Atomic-Server -->
+    <!-- { inject_html_head } -->
+    <!-- Javascript added by Atomic-Server -->
+    <!-- { inject_script } -->
+  </head>
+
+  <body>
+    <script>
+      // The app's dark mode setting ('always' | 'never' | 'auto', stored by
+      // useDarkMode) can override the OS preference. Apply it before first
+      // paint so the splash doesn't flash the wrong theme.
+      try {
+        var darkMode = JSON.parse(localStorage.getItem('darkMode'));
+
+        if (darkMode === 'always' || darkMode === 'never') {
+          document.documentElement.dataset.splashTheme =
+            darkMode === 'always' ? 'dark' : 'light';
+        }
+      } catch (e) {
+        // Broken localStorage value: fall back to the OS preference.
+      }
+    </script>
+    <div id="boot-splash" role="status" aria-live="polite">
+      <span class="boot-mark" aria-hidden="true">
+        <span class="boot-mark-system">
+          <!-- The fading trail from atomic.place's hero. Generated by
+               orbitTrailMarkup() in src/helpers/orbitTrail.ts; its test
+               fails if this drifts. -->
+          <svg class="boot-mark-sweep" viewBox="0 0 100 100" fill="none">
+            <!-- orbit-trail:start -->
+            <path d="M74 50 A 24 24 0 1 1 50 26" stroke="currentColor" stroke-width="14" stroke-linecap="round" stroke-opacity="0.013"/>
+            <path d="M73.88 52.35 A 24 24 0 1 1 50 26" stroke="currentColor" stroke-width="14" stroke-linecap="butt" stroke-opacity="0.026"/>
+            <path d="M73.54 54.68 A 24 24 0 1 1 50 26" stroke="currentColor" stroke-width="14" stroke-linecap="butt" stroke-opacity="0.026"/>
+            <path d="M72.97 56.97 A 24 24 0 1 1 50 26" stroke="currentColor" stroke-width="14" stroke-linecap="butt" stroke-opacity="0.027"/>
+            <path d="M72.17 59.18 A 24 24 0 1 1 50 26" stroke="currentColor" stroke-width="14" stroke-linecap="butt" stroke-opacity="0.028"/>
+            <path d="M71.17 61.31 A 24 24 0 1 1 50 26" stroke="currentColor" stroke-width="14" stroke-linecap="butt" stroke-opacity="0.029"/>
+            <path d="M69.96 63.33 A 24 24 0 1 1 50 26" stroke="currentColor" stroke-width="14" stroke-linecap="butt" stroke-opacity="0.029"/>
+            <path d="M68.55 65.23 A 24 24 0 1 1 50 26" stroke="currentColor" stroke-width="14" stroke-linecap="butt" stroke-opacity="0.03"/>
+            <path d="M66.97 66.97 A 24 24 0 1 1 50 26" stroke="currentColor" stroke-width="14" stroke-linecap="butt" stroke-opacity="0.031"/>
+            <path d="M65.23 68.55 A 24 24 0 1 1 50 26" stroke="currentColor" stroke-width="14" stroke-linecap="butt" stroke-opacity="0.032"/>
+            <path d="M63.33 69.96 A 24 24 0 1 1 50 26" stroke="currentColor" stroke-width="14" stroke-linecap="butt" stroke-opacity="0.033"/>
+            <path d="M61.31 71.17 A 24 24 0 1 1 50 26" stroke="currentColor" stroke-width="14" stroke-linecap="butt" stroke-opacity="0.034"/>
+            <path d="M59.18 72.17 A 24 24 0 1 1 50 26" stroke="currentColor" stroke-width="14" stroke-linecap="butt" stroke-opacity="0.036"/>
+            <path d="M56.97 72.97 A 24 24 0 1 1 50 26" stroke="currentColor" stroke-width="14" stroke-linecap="butt" stroke-opacity="0.037"/>
+            <path d="M54.68 73.54 A 24 24 0 1 1 50 26" stroke="currentColor" stroke-width="14" stroke-linecap="butt" stroke-opacity="0.037"/>
+            <path d="M52.35 73.88 A 24 24 0 1 1 50 26" stroke="currentColor" stroke-width="14" stroke-linecap="butt" stroke-opacity="0.039"/>
+            <path d="M50 74 A 24 24 0 0 1 50 26" stroke="currentColor" stroke-width="14" stroke-linecap="butt" stroke-opacity="0.04"/>
+            <path d="M47.65 73.88 A 24 24 0 0 1 50 26" stroke="currentColor" stroke-width="14" stroke-linecap="butt" stroke-opacity="0.042"/>
+            <path d="M45.32 73.54 A 24 24 0 0 1 50 26" stroke="currentColor" stroke-width="14" stroke-linecap="butt" stroke-opacity="0.044"/>
+            <path d="M43.03 72.97 A 24 24 0 0 1 50 26" stroke="currentColor" stroke-width="14" stroke-linecap="butt" stroke-opacity="0.046"/>
+            <path d="M40.82 72.17 A 24 24 0 0 1 50 26" stroke="currentColor" stroke-width="14" stroke-linecap="butt" stroke-opacity="0.048"/>
+            <path d="M38.69 71.17 A 24 24 0 0 1 50 26" stroke="currentColor" stroke-width="14" stroke-linecap="butt" stroke-opacity="0.05"/>
+            <path d="M36.67 69.96 A 24 24 0 0 1 50 26" stroke="currentColor" stroke-width="14" stroke-linecap="butt" stroke-opacity="0.053"/>
+            <path d="M34.77 68.55 A 24 24 0 0 1 50 26" stroke="currentColor" stroke-width="14" stroke-linecap="butt" stroke-opacity="0.056"/>
+            <path d="M33.03 66.97 A 24 24 0 0 1 50 26" stroke="currentColor" stroke-width="14" stroke-linecap="butt" stroke-opacity="0.059"/>
+            <path d="M31.45 65.23 A 24 24 0 0 1 50 26" stroke="currentColor" stroke-width="14" stroke-linecap="butt" stroke-opacity="0.063"/>
+            <path d="M30.04 63.33 A 24 24 0 0 1 50 26" stroke="currentColor" stroke-width="14" stroke-linecap="butt" stroke-opacity="0.067"/>
+            <path d="M28.83 61.31 A 24 24 0 0 1 50 26" stroke="currentColor" stroke-width="14" stroke-linecap="butt" stroke-opacity="0.072"/>
+            <path d="M27.83 59.18 A 24 24 0 0 1 50 26" stroke="currentColor" stroke-width="14" stroke-linecap="butt" stroke-opacity="0.078"/>
+            <path d="M27.03 56.97 A 24 24 0 0 1 50 26" stroke="currentColor" stroke-width="14" stroke-linecap="butt" stroke-opacity="0.085"/>
+            <path d="M26.46 54.68 A 24 24 0 0 1 50 26" stroke="currentColor" stroke-width="14" stroke-linecap="butt" stroke-opacity="0.092"/>
+            <path d="M26.12 52.35 A 24 24 0 0 1 50 26" stroke="currentColor" stroke-width="14" stroke-linecap="butt" stroke-opacity="0.098"/>
+            <path d="M26 50 A 24 24 0 0 1 50 26" stroke="currentColor" stroke-width="14" stroke-linecap="butt" stroke-opacity="0.079"/>
+            <path d="M26.12 47.65 A 24 24 0 0 1 50 26" stroke="currentColor" stroke-width="14" stroke-linecap="butt" stroke-opacity="0.086"/>
+            <path d="M26.46 45.32 A 24 24 0 0 1 50 26" stroke="currentColor" stroke-width="14" stroke-linecap="butt" stroke-opacity="0.094"/>
+            <path d="M27.03 43.03 A 24 24 0 0 1 50 26" stroke="currentColor" stroke-width="14" stroke-linecap="butt" stroke-opacity="0.104"/>
+            <path d="M27.83 40.82 A 24 24 0 0 1 50 26" stroke="currentColor" stroke-width="14" stroke-linecap="butt" stroke-opacity="0.115"/>
+            <path d="M28.83 38.69 A 24 24 0 0 1 50 26" stroke="currentColor" stroke-width="14" stroke-linecap="butt" stroke-opacity="0.131"/>
+            <path d="M30.04 36.67 A 24 24 0 0 1 50 26" stroke="currentColor" stroke-width="14" stroke-linecap="butt" stroke-opacity="0.15"/>
+            <path d="M31.45 34.77 A 24 24 0 0 1 50 26" stroke="currentColor" stroke-width="14" stroke-linecap="butt" stroke-opacity="0.177"/>
+            <path d="M33.03 33.03 A 24 24 0 0 1 50 26" stroke="currentColor" stroke-width="14" stroke-linecap="butt" stroke-opacity="0.215"/>
+            <path d="M34.77 31.45 A 24 24 0 0 1 50 26" stroke="currentColor" stroke-width="14" stroke-linecap="butt" stroke-opacity="0.273"/>
+            <path d="M36.67 30.04 A 24 24 0 0 1 50 26" stroke="currentColor" stroke-width="14" stroke-linecap="butt" stroke-opacity="0.376"/>
+            <path d="M38.69 28.83 A 24 24 0 0 1 50 26" stroke="currentColor" stroke-width="14" stroke-linecap="butt" stroke-opacity="0.602"/>
+            <path d="M40.82 27.83 A 24 24 0 0 1 50 26" stroke="currentColor" stroke-width="14" stroke-linecap="butt" stroke-opacity="1"/>
+            <circle cx="50" cy="26" r="7" fill="currentColor"/>
+            <!-- orbit-trail:end -->
+          </svg>
+          <svg class="boot-mark-orb" viewBox="0 0 24 24" fill="none">
+            <circle cx="12" cy="12" r="12" fill="url(#boot-orb)" />
+            <defs>
+              <linearGradient id="boot-orb" x1="24" y1="12" x2="0" y2="12" gradientUnits="userSpaceOnUse">
+                <stop stop-color="#01ECFF" />
+                <stop offset="1" stop-color="#2210FF" />
+              </linearGradient>
+            </defs>
+          </svg>
+        </span>
+      </span>
+      <p class="boot-caption">Loading __APP_NAME__…</p>
+    </div>
+    <div id="root"></div>
+
+    <script type="module" src="/src/index.tsx"></script>
+  </body>
+</html>

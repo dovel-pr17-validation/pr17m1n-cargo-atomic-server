@@ -1,0 +1,60 @@
+export * from './rpc.js';
+export * from './types.js';
+// Re-export @tomic/lib ontologies for convenience
+// We use the full paths to help bundlers with tree-shaking.
+export { core } from '@tomic/lib/ontologies/core.js';
+export { server } from '@tomic/lib/ontologies/server.js';
+export { dataBrowser } from '@tomic/lib/ontologies/dataBrowser.js';
+export { ai } from '@tomic/lib/ontologies/ai.js';
+export { collections } from '@tomic/lib/ontologies/collections.js';
+export { commits } from '@tomic/lib/ontologies/commits.js';
+// The run contract lives in @tomic/lib (the host needs it too); re-exported
+// here so plugin authors import everything from one package.
+export {
+  hasBlockingProblems,
+  LOCAL_REF_PREFIX,
+  parseVerdict,
+} from '@tomic/lib';
+export type {
+  CreateIntent,
+  DestroyIntent,
+  Intent,
+  Problem,
+  ProblemSeverity,
+  RemoveIntent,
+  SetIntent,
+  Verdict,
+} from '@tomic/lib';
+export {
+  VIEW_PROTOCOL_VERSION,
+  isViewRequest,
+  isViewKeyEvent,
+  viewRequest,
+  packagedViewOperations,
+} from './viewProtocol.js';
+export type {
+  ViewKeyEvent,
+  ViewOperation,
+  ViewRequest,
+  ViewResponse,
+} from './viewProtocol.js';
+export { parseSetupDeclaration, validateSetupArguments } from '@tomic/lib';
+export type { SetupDeclaration, SetupField, SetupArguments } from '@tomic/lib';
+export {
+  store,
+  ViewStore,
+  ViewResource,
+  forwardUnhandledKeys,
+} from './store.js';
+export type {
+  MenuItem,
+  MenuPoint,
+  PropValue,
+  QueryArgs,
+  SearchArgs,
+  ViewContext,
+} from './store.js';
+export { HOST_ERROR_CODES, HostError, toHostErrorCode } from './hostAbi.js';
+export type { AppExport, Effect, HostErrorCode } from './hostAbi.js';
+export { generateExportBindings } from './exportBindings.js';
+export type { BindingsManifest } from './exportBindings.js';

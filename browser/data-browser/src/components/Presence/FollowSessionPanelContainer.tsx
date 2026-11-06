@@ -1,0 +1,258 @@
+import { lazy, Suspense, useState } from 'react';
+import { useResource } from '@tomic/react';
+import { styled } from 'styled-components';
+import { FaNoteSticky, FaVideo } from 'react-icons/fa6';
+import { RightPanel } from '../RightPanel/RightPanel';
+import { useContextualPanel } from '../RightPanel/useContextualPanel';
+import { useRightPanel } from '../RightPanel/RightPanelContext';
+import { useFollow } from './FollowContext';
+import { useMeetingParticipants } from './useMeetingParticipants';
+import { PresenceAvatarMenu } from './PresenceAvatarMenu';
+import { ChatRoomView } from '../../views/ChatRoom/ChatRoomView';
+import { EditableTitle } from '../EditableTitle';
+import { MEETING_PANEL_TITLE_TRANSITION_TAG } from '../../helpers/transitionName';
+import { Column, Row } from '../Row';
+import { IconButton } from '../IconButton/IconButton';
+import { transition } from '../../helpers/transition';
+import { constructOpenURL } from '../../helpers/navigation';
+import { useNavigateWithTransition } from '../../hooks/useNavigateWithTransition';
+import { hasActionsHost } from '../../embed/hostActions';
+import { startHostCall } from '../../embed/joinCall';
+
+const ConferenceRoom = lazy(
+  () => import('../../chunks/Conference/ConferenceRoom'),
+);
+
+/**
+ * Right-side panel with the live meeting: who's here, the trail of
+ * resources the leader visits, plus chat. Shows the meeting you've
+ * joined (following its leader) or the one you're leading.
+ */
+export const FollowSessionPanelContainer: React.FC = () => {
+  const { followedSession, activeMeeting } = useFollow();
+  const { selectedMeeting } = useRightPanel();
+  const subject = selectedMeeting ?? followedSession ?? activeMeeting;
+  const isOpen = useContextualPanel('followSession', subject);
+
+  return (
+    <RightPanel isOpen={isOpen} testId='follow-session-panel'>
+      {isOpen && subject && (
+        <FollowSessionChat subject={subject} key={subject} />
+      )}
+    </RightPanel>
+  );
+};
+
+/**
+ * The meeting panel's content: title, who is here, chat, and End / Leave.
+ * `embedded` is for the Flutter app's web view: it is already on the meeting
+ * page, so Notes is left out, and the call is not placed here but by the app
+ * (a call page of its own that outlives this one, `joinCall` in
+ * `embed/hostActions.ts`); the video button is shown only when the app takes
+ * it. `trailing` adds an action (a close button) after the others.
+ */
+export function FollowSessionChat({
+  subject,
+  embedded = false,
+  trailing,
+}: {
+  subject: string;
+  embedded?: boolean;
+  trailing?: React.ReactNode;
+}) {
+  const chatroom = useResource(subject);
+  const { followedAgent, follow, unfollow, endMeeting } = useFollow();
+  const { setPanelOpen } = useRightPanel();
+  const { participants, leaderAgent, leading } =
+    useMeetingParticipants(subject);
+  const [ending, setEnding] = useState(false);
+  const [inCall, setInCall] = useState(false);
+  // The app answered false to a call: the button is no use here.
+  const [hostCallRefused, setHostCallRefused] = useState(false);
+
+  // The panel header's action: the leader ends the meeting; a joined
+  // attendee leaves it.
+  const label = leading ? 'End' : 'Leave';
+
+  async function handleAction() {
+    if (leading) {
+      setEnding(true);
+      await endMeeting();
+      setEnding(false);
+
+      return;
+    }
+
+    unfollow();
+    setPanelOpen('followSession', false);
+  }
+
+  // Placing the call is the app's: it also joins the meeting, as Join does.
+  async function handleHostCall() {
+    const started = await startHostCall({
+      meeting: subject,
+      leader: leaderAgent,
+      leading,
+      followed: followedAgent,
+      follow,
+    });
+
+    if (!started) setHostCallRefused(true);
+  }
+
+  // Only leader / joined attendee gets the End / Leave action.
+  const showAction = leading || followedAgent === leaderAgent;
+  const navigate = useNavigateWithTransition();
+
+  return (
+    <PanelWrapper>
+      <PanelHeader center justify='space-between'>
+        <TitleRow center gap='0.5rem'>
+          <PanelTitle
+            resource={chatroom}
+            transitionTag={MEETING_PANEL_TITLE_TRANSITION_TAG}
+          />
+          {participants.length > 0 && (
+            <Facepile title={`${participants.length} here`}>
+              {participants.slice(0, 5).map(subj => (
+                <PresenceAvatarMenu
+                  key={subj}
+                  agentSubject={subj}
+                  size='1.5rem'
+                />
+              ))}
+              {participants.length > 5 && (
+                <Overflow>+{participants.length - 5}</Overflow>
+              )}
+            </Facepile>
+          )}
+        </TitleRow>
+        {/* Compact and quiet, like the sidebar's quick-create icons: no
+            borders, no gaps, a soft background on hover. Bordered buttons
+            with space between them made the header the loudest part of the
+            panel. */}
+        <ButtonRow center gap='0'>
+          {!embedded && (
+            <IconButton
+              color={inCall ? 'main' : 'textLight'}
+              onClick={() => setInCall(current => !current)}
+              title={inCall ? 'Leave video call' : 'Start video call'}
+            >
+              <FaVideo />
+            </IconButton>
+          )}
+          {embedded && hasActionsHost() && !hostCallRefused && (
+            <IconButton
+              color='textLight'
+              onClick={() => void handleHostCall()}
+              title='Start video call'
+            >
+              <FaVideo />
+            </IconButton>
+          )}
+          {!embedded && (
+            <IconButton
+              color='textLight'
+              title='Notes'
+              onClick={() => navigate(constructOpenURL(subject))}
+            >
+              <FaNoteSticky />
+            </IconButton>
+          )}
+          {showAction && (
+            <TextAction type='button' onClick={handleAction} disabled={ending}>
+              {ending ? 'Ending…' : label}
+            </TextAction>
+          )}
+          {trailing}
+        </ButtonRow>
+      </PanelHeader>
+      {inCall && !embedded && (
+        <Suspense fallback={<CallFallback>Connecting to call…</CallFallback>}>
+          <ConferenceRoom subject={subject} onLeave={() => setInCall(false)} />
+        </Suspense>
+      )}
+      <ChatRoomView resource={chatroom} noContainerPadding />
+    </PanelWrapper>
+  );
+}
+
+const PanelWrapper = styled(Column)`
+  height: 100%;
+  gap: 0;
+`;
+
+const PanelHeader = styled(Row)`
+  padding-block: ${p => p.theme.size(2)};
+`;
+
+/** Shrinks to make room for ButtonRow; the panel is narrow by nature, so the
+ *  title — not the actions — gives way first, truncating with an ellipsis. */
+const TitleRow = styled(Row)`
+  min-width: 0;
+  flex: 1 1 auto;
+  overflow: hidden;
+`;
+
+/** Icon-only actions, so they keep their size and the title truncates
+ *  instead of squishing them. */
+const ButtonRow = styled(Row)`
+  flex-shrink: 0;
+`;
+
+/** The meeting name, click-to-edit. */
+const PanelTitle = styled(EditableTitle)`
+  font-size: 1rem;
+  margin: 0;
+  min-width: 0;
+  width: auto;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+`;
+
+/** A text action in the same quiet style as the icon buttons beside it. */
+const TextAction = styled.button`
+  height: 2em;
+  padding: 0 0.6em;
+  border: none;
+  border-radius: ${p => p.theme.radius};
+  background: transparent;
+  color: ${p => p.theme.colors.textLight};
+  font: inherit;
+  cursor: pointer;
+  ${transition('background-color', 'color')};
+
+  &:not([disabled]):hover,
+  &:not([disabled]):focus-visible {
+    background: ${p => p.theme.colors.bg1};
+    color: ${p => p.theme.colors.text};
+  }
+
+  &[disabled] {
+    opacity: 0.5;
+    cursor: not-allowed;
+  }
+`;
+
+const CallFallback = styled.span`
+  font-size: 0.8rem;
+  color: ${p => p.theme.colors.textLight};
+  text-align: center;
+  padding-block: ${p => p.theme.size(2)};
+`;
+
+const Facepile = styled.span`
+  display: inline-flex;
+  align-items: center;
+
+  & > *:not(:first-child) {
+    margin-left: -0.4rem;
+  }
+`;
+
+const Overflow = styled.span`
+  margin-left: 0.15rem;
+  font-size: 0.8rem;
+  color: ${p => p.theme.colors.textLight};
+`;

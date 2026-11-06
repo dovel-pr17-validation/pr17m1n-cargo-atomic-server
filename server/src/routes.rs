@@ -1,0 +1,510 @@
+//! Contains routing logic, sends the client to the correct handler.
+//! We should try to minimize what happens in here, since most logic should be defined in Atomic Data - not in the server itself.
+
+use crate::{content_types, handlers};
+use actix_web::{
+    guard,
+    http::{header, Method},
+    web, HttpRequest, HttpResponse,
+};
+use actix_web_static_files::ResourceFiles;
+use std::collections::HashMap;
+use std::sync::OnceLock;
+
+/// Should match all routes
+const ANY: &str = "{tail:.*}";
+
+// Includes the js assets from the `browser` folder,
+// used for hosting the front-end JS bundles, service workers,
+// css, icons and other static files.
+// See build.rs for more info.
+include!(concat!(env!("OUT_DIR"), "/generated.rs"));
+
+/// Lightweight index of the embedded resource map, computed once.
+/// `static_files::Resource` is not `Clone`, so we can't cache the whole
+/// HashMap in a `OnceLock` and pass it to `ResourceFiles` too —
+/// instead we mirror just the fields the precompressed-asset handler
+/// reads (data + mime type), keyed by path. `ResourceFiles::new` calls
+/// `generate()` again at startup; that allocation only happens once
+/// per worker, not per request.
+fn precompressed_index() -> &'static HashMap<&'static str, (&'static [u8], &'static str)> {
+    static INDEX: OnceLock<HashMap<&'static str, (&'static [u8], &'static str)>> = OnceLock::new();
+    INDEX.get_or_init(|| {
+        generate()
+            .into_iter()
+            .map(|(k, v)| (k, (v.data, v.mime_type)))
+            .collect()
+    })
+}
+
+/// Serve a pre-compressed `.br` asset when the request supports brotli
+/// AND a precompressed sibling exists in the embedded resource map.
+/// The build script (`build.rs`) writes these at brotli q11, which is
+/// considerably tighter than actix's runtime `Compress` middleware
+/// (default q ~ 3). For the Loro WASM this is ~250 KB on the wire saved.
+///
+/// This handler is mounted BEFORE `ResourceFiles` with a guard that
+/// only matches when the precompressed file is actually available, so
+/// requests for non-precompressed paths (or clients that don't accept
+/// brotli) fall through to the normal asset handler.
+async fn serve_precompressed_br(req: HttpRequest) -> HttpResponse {
+    let path = req.uri().path().trim_start_matches('/');
+    let map = precompressed_index();
+    let br_key: String = format!("{}.br", path);
+    let (Some((br_data, _)), Some((_, mime))) = (map.get(br_key.as_str()), map.get(path)) else {
+        return HttpResponse::NotFound().finish();
+    };
+    HttpResponse::Ok()
+        .insert_header((header::CONTENT_TYPE, *mime))
+        .insert_header((header::CONTENT_ENCODING, "br"))
+        .insert_header((header::VARY, "Accept-Encoding"))
+        .body(*br_data)
+}
+
+/// Guard that passes when the request both accepts brotli AND there is a
+/// precompressed `<path>.br` available in the embedded resource map.
+fn precompressed_br_available(ctx: &guard::GuardContext<'_>) -> bool {
+    let head = ctx.head();
+    let accepts_br = head
+        .headers
+        .get(header::ACCEPT_ENCODING)
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|v| v.split(',').any(|enc| enc.trim().starts_with("br")));
+    if !accepts_br {
+        return false;
+    }
+    let path = head.uri.path().trim_start_matches('/');
+    let map = precompressed_index();
+    let br_key = format!("{}.br", path);
+    map.contains_key(br_key.as_str()) && map.contains_key(path)
+}
+
+fn node_id_from_did(node_did: &str) -> Result<&str, &'static str> {
+    let Some(rest) = atomic_lib::identifiers::node_id(node_did) else {
+        return Err("Expected nodeId to use atomic:node:<node-id>");
+    };
+    let node_id = rest.split(':').next().unwrap_or(rest);
+    if node_id.is_empty() {
+        return Err("Expected nodeId to include a node id");
+    }
+    if node_id.len() != 64 || !node_id.chars().all(|c| c.is_ascii_hexdigit()) {
+        return Err("Expected nodeId to include a 64-character hex node id");
+    }
+
+    Ok(node_id)
+}
+
+/// POST /iroh-sync { "nodeId": "did:ad:node:<node-id>", "drive": "..." }
+/// Triggers an Iroh peer sync from the server to the given Node DID.
+///
+/// Requires a signed agent with write rights on `drive`. The dial path applies
+/// what the remote sends with `trust_owned` (we chose to dial it, so a relayed
+/// write to a drive this node owns is accepted), which is exactly why nobody
+/// but a writer of that drive may make this node dial a node of their choosing:
+/// an unauthenticated caller could otherwise point it at a hostile peer that
+/// answers with overwrites and removals for every drive the node owns, and get
+/// that peer recorded as a known, auto-reconnecting device.
+async fn iroh_sync_handler(
+    body: web::Json<serde_json::Value>,
+    appstate: web::Data<crate::appstate::AppState>,
+    req: HttpRequest,
+) -> crate::errors::AtomicServerResult<actix_web::HttpResponse> {
+    let node_id = match body.get("nodeId").and_then(|v| v.as_str()) {
+        Some(id) => match node_id_from_did(id) {
+            Ok(node_id) => node_id,
+            Err(error) => {
+                return Ok(
+                    actix_web::HttpResponse::BadRequest().json(serde_json::json!({"error": error}))
+                );
+            }
+        },
+        None => {
+            return Ok(actix_web::HttpResponse::BadRequest()
+                .json(serde_json::json!({"error": "Missing nodeId"})));
+        }
+    };
+    let drive = match body.get("drive").and_then(|v| v.as_str()) {
+        Some(d) => d,
+        None => {
+            return Ok(actix_web::HttpResponse::BadRequest()
+                .json(serde_json::json!({"error": "Missing drive"})));
+        }
+    };
+
+    use atomic_lib::Storelike;
+    // The client signs the full request URL; rebuild it exactly.
+    let origin = crate::context::RequestContext::new(&req, &appstate).origin;
+    let full_url = format!("{}{}", origin, req.uri());
+    let for_agent = crate::helpers::get_client_agent(req.headers(), &appstate, &full_url).await?;
+    crate::helpers::enforce_write_rate_limit(&appstate, &req, &for_agent)?;
+    if matches!(for_agent, atomic_lib::agents::ForAgent::Public) {
+        return Err(atomic_lib::errors::AtomicError::unauthorized(
+            "Syncing with a peer requires a signed-in agent with write rights on the drive".into(),
+        )
+        .into());
+    }
+    // A drive this node already holds: the caller must be able to write it.
+    // A drive it has never seen is a bootstrap pull, which is a new drive
+    // arriving here; the sync policy decides who may do that (any signed-in
+    // agent on an open node, only the owner in Owner mode).
+    match appstate
+        .store
+        .get_resource(&atomic_lib::Subject::from(drive))
+        .await
+    {
+        Ok(drive_resource) => {
+            atomic_lib::hierarchy::check_write(&appstate.store, &drive_resource, &for_agent)
+                .await?;
+        }
+        Err(_) => {
+            if !appstate
+                .store
+                .sync_policy()
+                .may_enroll_drive(drive, &for_agent)
+            {
+                return Err(atomic_lib::errors::AtomicError::unauthorized(format!(
+                    "{for_agent} may not bring drive {drive} onto this node"
+                ))
+                .into());
+            }
+        }
+    }
+
+    Ok(
+        match atomic_lib::sync::peer::sync_drive_with_peer_outcome(node_id, drive, &appstate.store)
+            .await
+        {
+            Ok(outcome) => actix_web::HttpResponse::Ok().json(serde_json::json!({
+            "count": outcome.count,
+            // Both directions. Reporting only `count` (what we pulled) made a
+            // pass that pushed 49 resources and pulled 1 read as
+            // "Synced 1 resource" — the user cannot tell a working sync from a
+            // stalled one if the number only describes half of it.
+            "pushed": outcome.pushed,
+            // `peerName` is the remote's self-reported `HELLO` label.
+            // Older peers that don't speak HELLO yet send `null`; the UI
+            // falls back to a truncated Node DID in that case.
+                "peerName": outcome.peer_name,
+                "status": "ok",
+            })),
+            Err(e) => actix_web::HttpResponse::InternalServerError()
+                .json(serde_json::json!({"error": e.to_string()})),
+        },
+    )
+}
+
+/// The hosted MCP endpoint and its OAuth authorization server. See
+/// `crate::mcp`. Registered before the catch-all routes so that the
+/// `.well-known` and `/oauth` paths are not read as resource subjects.
+fn configure_mcp_routes(app: &mut actix_web::web::ServiceConfig) {
+    use crate::mcp::{endpoint, oauth};
+
+    app.service(
+        web::resource("/.well-known/oauth-protected-resource")
+            .route(web::get().to(oauth::protected_resource_metadata)),
+    )
+    .service(
+        web::resource("/.well-known/oauth-protected-resource/mcp")
+            .route(web::get().to(oauth::protected_resource_metadata)),
+    )
+    .service(
+        web::resource("/.well-known/oauth-authorization-server")
+            .route(web::get().to(oauth::authorization_server_metadata)),
+    )
+    .service(web::resource("/oauth/register").route(web::post().to(oauth::register)))
+    .service(web::resource("/oauth/authorize").route(web::get().to(oauth::authorize)))
+    .service(web::resource("/oauth/agent").route(web::post().to(oauth::issue_agent)))
+    .service(web::resource("/oauth/approve").route(web::post().to(oauth::approve)))
+    .service(web::resource("/oauth/token").route(web::post().to(oauth::token)))
+    .service(
+        web::resource("/mcp")
+            .route(web::post().to(endpoint::mcp))
+            .route(web::get().to(endpoint::mcp_get)),
+    );
+}
+
+/// Registers single-handler routes (`post "/path" => handler`) one per line.
+/// Statement order is registration order, so it keeps the same precedence as
+/// chained `.service` calls.
+#[cfg(feature = "wasm-plugins")]
+macro_rules! plain_routes {
+    ($app:expr; $($method:ident $path:literal => $handler:path),+ $(,)?) => {
+        $( $app.service(web::resource($path).route(web::$method().to($handler))); )+
+    };
+}
+
+/// Like [plain_routes], for POST handlers that read their JSON body as
+/// `web::Bytes` (so a version 2 request signature can cover it). Bytes are
+/// bounded by `PayloadConfig`, so each route carries the limit `web::Json`
+/// used to enforce.
+#[cfg(feature = "wasm-plugins")]
+macro_rules! json_routes {
+    ($app:expr; $($path:literal => $handler:path),+ $(,)?) => {
+        $( $app.service(
+            web::resource($path)
+                .app_data(web::PayloadConfig::new(crate::helpers::JSON_BODY_LIMIT))
+                .route(web::post().to($handler)),
+        ); )+
+    };
+}
+
+/// Set up the Actix server routes. This defines which paths are used.
+// Keep in mind that the order of these matters. An early, greedy route will take
+// precedence over a later route.
+fn configure_wasm_plugin_routes(app: &mut actix_web::web::ServiceConfig) {
+    #[cfg(not(feature = "wasm-plugins"))]
+    let _ = app;
+    #[cfg(feature = "wasm-plugins")]
+    {
+        app.service(web::resource("/plugin-ui").to(handlers::plugin_ui::handle_plugin_ui));
+        json_routes!(app;
+            "/plugin-release-pin" => handlers::plugin_release::pin,
+            "/plugin-external-read" => handlers::plugin_external::read,
+        );
+        plain_routes!(app;
+            post "/plugin-view-token" => handlers::plugin_ui::handle_mint_view_token,
+        );
+        app.service(web::resource("/plugin-list").to(handlers::plugin_ui::handle_plugin_list));
+        json_routes!(app;
+            "/integration-action-history-compact" => handlers::integration_action::compact_history,
+            "/integration-action-consumers" => handlers::integration_action::consumers,
+            "/integration-action-consumer-abandon" => handlers::integration_action::abandon_consumer,
+            "/integration-action-history" => handlers::integration_action::history,
+            "/integration-action-cancel" => handlers::integration_action::cancel,
+            "/integration-action-grant" => handlers::integration_action::grant,
+            "/integration-action-grants" => handlers::integration_action::grants,
+            "/integration-action-recovery-inspect" => handlers::integration_action::inspect_recovery,
+            "/integration-action-recovery-confirm" => handlers::integration_action::confirm_recovery,
+            "/integration-actions" => handlers::integration_action::list,
+            "/integration-action-call" => handlers::integration_action::invoke,
+            "/integration-action-proposals" => handlers::integration_action::proposals,
+            "/integration-action-approve" => handlers::integration_action::approve,
+            "/plugin-sync-preview" => handlers::plugin_sync::preview,
+            "/plugin-sync-apply" => handlers::plugin_sync::apply,
+            "/plugin-sync-schedule" => handlers::plugin_sync::schedule,
+            "/plugin-sync-status" => handlers::plugin_sync::status,
+            "/plugin-connection-state" => handlers::plugin_connection::read,
+            "/plugin-connection-checkpoint" => handlers::plugin_connection::checkpoint,
+            "/plugin-external-status" => handlers::plugin_external::status,
+            "/plugin-external-confirm" => handlers::plugin_external::confirm,
+            "/plugin-external-apply" => handlers::plugin_external::apply,
+            "/plugin-release" => handlers::plugin_release::publish,
+        );
+        plain_routes!(app;
+            get "/plugin-package/{id}" => handlers::plugin_release::package,
+            get "/plugin-package/{id}/zip" => handlers::plugin_release::package_zip,
+            get "/plugin-catalog" => handlers::plugin_release::catalog,
+            post "/plugin-release-package" => handlers::plugin_release::publish_package,
+            // Calls an app's export from outside the sandbox. See the handler.
+            post "/host/call" => handlers::host_call::handle_host_call,
+        );
+        app.service(
+            web::resource("/plugin-run")
+                // A file handed to an importer travels in the body.
+                .app_data(web::PayloadConfig::new(
+                    handlers::plugin_run::RUN_JSON_LIMIT,
+                ))
+                .route(web::post().to(handlers::plugin_run::handle_plugin_run)),
+        );
+        app.service(
+            web::resource("/plugin-schedule")
+                .app_data(web::PayloadConfig::new(crate::helpers::JSON_BODY_LIMIT))
+                .route(web::post().to(handlers::plugin_schedule::handle_set_schedule))
+                .route(web::get().to(handlers::plugin_schedule::handle_get_schedule))
+                .route(web::delete().to(handlers::plugin_schedule::handle_clear_pending)),
+        );
+        json_routes!(app;
+            "/plugin-resume" => handlers::plugin_schedule::handle_resume,
+            "/plugin-auto-apply" => handlers::plugin_schedule::handle_set_auto_apply,
+            "/app-write" => handlers::app_write::handle_app_write,
+        );
+        app.service(
+            web::resource("/plugin-trigger")
+                .app_data(web::PayloadConfig::new(crate::helpers::JSON_BODY_LIMIT))
+                .route(web::post().to(handlers::plugin_trigger::handle_set_trigger))
+                .route(web::get().to(handlers::plugin_trigger::handle_get_trigger)),
+        );
+    }
+}
+
+pub fn config_routes(app: &mut actix_web::web::ServiceConfig) {
+    handlers::website::control_routes(app);
+    app.service(
+        web::resource("/upload")
+            .guard(guard::Method(Method::POST))
+            .to(handlers::upload::upload_handler),
+    )
+    .service(
+        web::resource(handlers::client_reports::TUNNEL_PATH)
+            .guard(guard::Method(Method::POST))
+            .to(handlers::client_reports::relay),
+    )
+    .service(
+        web::resource("/commit")
+            .guard(guard::Method(Method::POST))
+            .to(handlers::commit::post_commit),
+    )
+    .service(web::resource("/download/{path:[^{}]+}").to(handlers::download::handle_download))
+    .service(
+        web::resource("/blob/{hash}")
+            .guard(guard::Method(Method::PUT))
+            .to(handlers::blob::put_blob),
+    )
+    .service(
+        web::resource("/bind-drive")
+            .guard(guard::Method(Method::POST))
+            .to(handlers::post_resource::handle_post_resource),
+    )
+    .service(
+        web::resource("/form/{id}/definition")
+            .guard(guard::Method(Method::GET))
+            .to(handlers::form::get_definition),
+    )
+    .service(
+        web::resource("/form/{id}/submit")
+            .guard(guard::Method(Method::POST))
+            .to(handlers::form::submit_form),
+    )
+    .service(
+        web::resource("/form/{id}/challenge")
+            .guard(guard::Method(Method::GET))
+            .to(handlers::form::get_challenge),
+    )
+    .service(
+        web::resource("/form/{id}/image")
+            .guard(guard::Method(Method::GET))
+            .to(handlers::form::form_image),
+    )
+    .service(
+        web::resource("/form/{id}")
+            .guard(guard::Method(Method::GET))
+            .to(handlers::form::form_page),
+    )
+    .service(web::resource("/ws").to(handlers::web_sockets::web_socket_handler))
+    .service(web::resource("/genesis").route(web::get().to(handlers::genesis::handle_genesis)))
+    .service(web::resource("/drive-usage").to(handlers::drive_usage::handle_drive_usage))
+    .service(
+        web::resource("/drive-usage/breakdown")
+            .to(handlers::drive_usage::handle_drive_usage_breakdown),
+    )
+    .service(
+        web::resource("/history-attribution")
+            .to(handlers::history_attribution::handle_history_attribution),
+    )
+    .service(
+        web::resource("/forget-peer")
+            .guard(guard::Method(Method::POST))
+            .to(handlers::forget_peer::handle_forget_peer),
+    )
+    .service(web::resource("/iroh-sync").route(web::post().to(iroh_sync_handler)))
+    .configure(configure_mcp_routes)
+    .service(web::resource("/export").to(handlers::export::handle_export))
+    .configure(configure_wasm_plugin_routes)
+    .service(
+        web::resource("/app-agent")
+            .route(web::post().to(handlers::app_agent::handle_set_app_agent))
+            .route(web::get().to(handlers::app_agent::handle_get_app_agent))
+            .route(web::delete().to(handlers::app_agent::handle_delete_app_agent)),
+    )
+    .service(
+        web::resource("/plugin-secret")
+            .app_data(web::PayloadConfig::new(crate::helpers::JSON_BODY_LIMIT))
+            .route(web::post().to(handlers::plugin_secret::handle_set_secret))
+            .route(web::get().to(handlers::plugin_secret::handle_list_secrets))
+            .route(web::delete().to(handlers::plugin_secret::handle_delete_secret)),
+    )
+    // Serve pre-compressed brotli assets when:
+    //   - The client sends `Accept-Encoding: br`, AND
+    //   - The build script wrote a `<path>.br` sibling into the
+    //     embedded resource map (see `build.rs::precompress_assets`).
+    // The guard short-circuits this service when either condition is
+    // missing, so the request falls through to the normal
+    // `ResourceFiles` handler below — which then serves the original
+    // (and gets compressed at runtime by `middleware::Compress` if
+    // applicable). Must be registered BEFORE `ResourceFiles` so that
+    // ResourceFiles' own `skip_handler_when_not_found` guard doesn't
+    // claim the request first.
+    .service(
+        web::resource(ANY)
+            .guard(guard::Method(Method::GET))
+            .guard(guard::fn_guard(precompressed_br_available))
+            .to(serve_precompressed_br),
+    )
+    // This `generate` imports the static files from the `app_assets` folder
+    .service(
+        ResourceFiles::new("/", generate())
+            .skip_handler_when_not_found()
+            .do_not_resolve_defaults(),
+    )
+    // Catch all (non-download) HTML requests and send them to the single page app
+    .service(
+        web::resource(ANY)
+            .guard(guard::Method(Method::GET))
+            .guard(guard::fn_guard(|guard_ctx| {
+                content_types::get_accept(guard_ctx.head().headers())
+                    == content_types::ContentType::Html
+            }))
+            .to(handlers::single_page_app::single_page),
+    )
+    .service(
+        web::resource("/search")
+            .guard(guard::Method(Method::GET))
+            .to(handlers::search::search_query),
+    );
+    #[cfg(feature = "vector-search")]
+    app.service(
+        web::resource("/vector_search")
+            .guard(guard::Method(Method::GET))
+            .to(handlers::vector_search::vector_search_query),
+    );
+    app.service(
+        web::resource(ANY)
+            .guard(guard::Method(Method::POST))
+            .to(handlers::post_resource::handle_post_resource),
+    )
+    .service(
+        web::resource(ANY)
+            .guard(guard::Method(Method::GET))
+            .to(handlers::get_resource::handle_get_resource),
+    )
+    // Also allow the home resource (not matched by the previous one)
+    .service(web::resource("/").to(handlers::get_resource::handle_get_resource));
+}
+
+#[cfg(test)]
+mod node_id_tests {
+    use super::node_id_from_did;
+
+    #[test]
+    fn accepts_node_did() {
+        let node_id = "a".repeat(64);
+        assert_eq!(
+            node_id_from_did(&format!("did:ad:node:{node_id}")).unwrap(),
+            node_id
+        );
+    }
+
+    #[test]
+    fn accepts_node_did_with_label_suffix() {
+        let node_id = "a".repeat(64);
+        assert_eq!(
+            node_id_from_did(&format!("did:ad:node:{node_id}:Joe%27s%20Tablet")).unwrap(),
+            node_id
+        );
+    }
+
+    #[test]
+    fn rejects_iroh_prefix() {
+        assert!(node_id_from_did("iroh:abcdef").is_err());
+    }
+
+    #[test]
+    fn rejects_raw_node_id() {
+        assert!(node_id_from_did(&"a".repeat(64)).is_err());
+    }
+
+    #[test]
+    fn rejects_invalid_node_id() {
+        assert!(node_id_from_did("did:ad:node:not-a-node").is_err());
+    }
+}

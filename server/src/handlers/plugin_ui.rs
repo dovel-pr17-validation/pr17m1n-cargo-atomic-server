@@ -1,0 +1,732 @@
+use actix_web::{http::header, web, HttpResponse};
+use atomic_lib::{
+    db::plugin_meta::PluginMetaKey, hierarchy::check_read, urls, Storelike, Subject, Value,
+};
+use base64::{engine::general_purpose, Engine as _};
+
+use crate::{
+    appstate::AppState,
+    errors::{AtomicServerError, AtomicServerResult},
+    helpers::get_client_agent_for_signed_url,
+};
+
+#[derive(serde::Deserialize, Debug)]
+pub struct PluginUiQuery {
+    pub drive: String,
+    /// Either `namespace.name` of an installed plugin, or the subject of a
+    /// plugin resource on the drive.
+    pub plugin: String,
+    pub format: String,
+    /// Required when `plugin` is a subject: a null-origin iframe cannot sign a
+    /// request, so the authenticated parent mints it a capability instead.
+    pub token: Option<String>,
+}
+
+/// A plugin whose source lives in the drive rather than on the filesystem.
+///
+/// Told apart by shape: an installed plugin is `namespace.name`, and a subject
+/// is a URL or a DID. Both have dots, neither has a scheme separator.
+fn is_subject(plugin: &str) -> bool {
+    plugin.contains(':')
+}
+
+#[derive(serde::Deserialize, Debug)]
+#[serde(rename_all = "camelCase")]
+pub struct MintTokenBody {
+    pub drive: String,
+    pub plugin: String,
+}
+
+#[derive(serde::Serialize, Debug)]
+#[serde(rename_all = "camelCase")]
+pub struct MintedToken {
+    pub token: String,
+    pub expires_at: i64,
+}
+
+/// Mints the capability an iframe needs to read one plugin's source.
+///
+/// Takes read rights, not write: opening a view is reading its code. The check
+/// is against the requesting agent, so a token can never widen what the person
+/// who asked for it could already see.
+#[tracing::instrument(skip(appstate, raw, req))]
+pub async fn handle_mint_view_token(
+    appstate: web::Data<AppState>,
+    raw: web::Bytes,
+    req: actix_web::HttpRequest,
+    context: crate::context::RequestContext,
+) -> AtomicServerResult<HttpResponse> {
+    // Raw bytes rather than `web::Json`, so a version 2 request signature can
+    // cover exactly the body acted on.
+    let body: MintTokenBody = crate::helpers::parse_json(&raw)?;
+    if !is_subject(&body.plugin) {
+        return Err(AtomicServerError::bad_request(
+            "Only a plugin stored in the drive needs a token",
+        ));
+    }
+
+    let store = &appstate.store;
+    let resource = store.get_resource(&body.plugin.as_str().into()).await?;
+
+    let agent = crate::helpers::authenticate(&req, &appstate, &context, &raw).await?;
+    check_read(store, &resource, &agent).await?;
+
+    let now = atomic_lib::utils::now();
+    let token = appstate.view_tokens.mint(&body.drive, &body.plugin, now);
+
+    Ok(HttpResponse::Ok().json(MintedToken {
+        token,
+        expires_at: now + crate::plugins::view_token::TTL_MS,
+    }))
+}
+
+#[derive(serde::Deserialize, Debug)]
+pub struct UIPluginListQuery {
+    pub drive: String,
+}
+
+#[derive(serde::Serialize, Debug)]
+pub struct PluginUIManifest {
+    pub css: bool,
+}
+
+#[derive(serde::Serialize, Debug)]
+#[serde(rename_all = "camelCase")]
+pub struct UIPluginListItem {
+    pub plugin: String,
+    pub classes: Vec<String>,
+    pub ui_manifest: PluginUIManifest,
+    pub resource: String,
+}
+
+/// The `plugin` query parameter is `namespace.name`, both identifiers being
+/// `[A-Za-z0-9_-]` (see `validate_plugin_identifiers`). Anything else could
+/// steer the file lookup below out of the plugin directory.
+fn split_plugin_name(plugin: &str) -> AtomicServerResult<(&str, &str)> {
+    let (namespace, name) = plugin
+        .split_once('.')
+        .ok_or("Invalid plugin name, expected `namespace.name`")?;
+    atomic_lib::db::plugin_meta::validate_plugin_identifiers(namespace, name)?;
+    Ok((namespace, name))
+}
+
+/// A file of the release an Installation pins (`ui.js`, `ui.css`), read from
+/// its package.
+async fn release_file(
+    appstate: &AppState,
+    installation: &atomic_lib::Resource,
+    format: &str,
+) -> AtomicServerResult<Option<Vec<u8>>> {
+    if !matches!(format, "js" | "css") {
+        return Err("Invalid format".into());
+    }
+    let Ok(Value::String(release_id)) = installation.get(urls::RELEASE_ID) else {
+        return Ok(None);
+    };
+    Ok(
+        crate::plugins::release::package_file(&appstate.store, release_id, &format!("ui.{format}"))
+            .await?,
+    )
+}
+
+/// Generates a random CSP nonce for the plugin iframe document.
+fn plugin_nonce() -> String {
+    use ring::rand::{SecureRandom, SystemRandom};
+    let mut bytes = [0u8; 32];
+    // Falls back to a fixed (still-functional) value only if the RNG fails,
+    // which in practice never happens.
+    if SystemRandom::new().fill(&mut bytes).is_err() {
+        return "atomic-plugin-nonce".to_string();
+    }
+    general_purpose::URL_SAFE_NO_PAD.encode(bytes)
+}
+
+/// Builds the HTML document that hosts a plugin's custom view. Served as a real
+/// network response (not a client-side `srcdoc`) so it gets its OWN
+/// Content-Security-Policy instead of inheriting the parent SPA's nonce-locked
+/// CSP — otherwise the plugin's `<script>` is blocked on any CSP-enforced
+/// server. The parent fetches private assets with signed requests, then hands
+/// their contents to this shell. Only messages from that parent can install
+/// the module, which is locked to a fresh per-response nonce. No credentials
+/// are exposed to the null-origin plugin (see PluginView.tsx).
+fn render_plugin_ui_html(nonce: &str) -> String {
+    format!(
+        r#"<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>Plugin</title>
+<style>html,body{{margin:0;padding:0;height:100%}}#root{{height:100%}}</style>
+<style id="__atomic_theme"></style>
+<script nonce="{nonce}">
+var loaded = false;
+window.addEventListener('message', function (e) {{
+  if (e.source !== window.parent) return;
+  if (e.data && e.data.type === '__atomic_style') {{
+    var s = document.getElementById('__atomic_theme');
+    if (s) s.textContent = e.data.css;
+  }}
+  if (!loaded && e.data && e.data.type === '__atomic_plugin_assets' &&
+      typeof e.data.js === 'string' && typeof e.data.css === 'string') {{
+    loaded = true;
+    var style = document.createElement('style');
+    style.textContent = e.data.css;
+    document.head.appendChild(style);
+    var script = document.createElement('script');
+    script.type = 'module';
+    script.nonce = '{nonce}';
+    script.textContent = e.data.js;
+    document.head.appendChild(script);
+  }}
+}});
+if (window.parent) window.parent.postMessage({{ type: '__atomic_plugin_ready' }}, '*');
+</script>
+</head>
+<body><div id="root"></div></body>
+</html>"#
+    )
+}
+
+/// `calls_view`: a plugin whose source is in the drive exports `view` and is
+/// called, rather than executing on import. That is what makes it writable by
+/// someone who has never seen this codebase — there is no bootstrap to
+/// reproduce, just a function that receives what it needs.
+fn render_drive_plugin_ui_html_with(
+    query_string: &str,
+    css_exists: bool,
+    nonce: &str,
+    calls_view: bool,
+) -> String {
+    let js_url = format!(
+        "/plugin-ui?{}",
+        query_string.replace("format=html", "format=js")
+    );
+    let client_url = format!(
+        "/plugin-ui?{}",
+        query_string.replace("format=html", "format=client")
+    );
+    let css_link = if css_exists {
+        let css_url = format!(
+            "/plugin-ui?{}",
+            query_string.replace("format=html", "format=css")
+        );
+        format!(r#"<link rel="stylesheet" href="{css_url}" />"#)
+    } else {
+        String::new()
+    };
+
+    let script = if calls_view {
+        // Failures surface in the frame instead of only in a console nobody
+        // has open: a plugin that throws on load would otherwise render as a
+        // blank panel, which reads as "the host is broken".
+        //
+        // They are also reported to the host, because rendering the message
+        // here is a dead end: the frame is null-origin, so nothing outside it
+        // can read this text, and the person who has to fix the app is on the
+        // other side of that boundary.
+        format!(
+            r#"<script type="module" nonce="{nonce}">
+import * as plugin from "{js_url}";
+import {{ store }} from "{client_url}";
+const root = document.getElementById('root');
+try {{
+  if (typeof plugin.view !== 'function') {{
+    throw new Error('This plugin exports no view() function.');
+  }}
+  await plugin.view({{ root, store }});
+  // Says it got to the end, and how much it drew. Silence is not success: an
+  // app whose view() resolves having rendered nothing is a blank panel, which
+  // looks exactly like one that never loaded. The count tells those apart.
+  if (window.parent) {{
+    window.parent.postMessage({{
+      type: '__atomic_plugin_rendered',
+      children: root.childElementCount,
+    }}, '*');
+  }}
+}} catch (e) {{
+  root.textContent = String(e && e.message ? e.message : e);
+  window.__atomicReportError(e, 'load');
+}}
+</script>"#
+        )
+    } else {
+        format!(r#"<script type="module" src="{js_url}" nonce="{nonce}"></script>"#)
+    };
+
+    format!(
+        r#"<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>Plugin</title>
+{css_link}
+<style>html,body{{margin:0;padding:0;height:100%}}#root{{height:100%}}</style>
+<style id="__atomic_theme"></style>
+{script}
+<script nonce="{nonce}">
+// An app fails where the person who can fix it cannot see it. The frame is
+// null-origin by design, so its console belongs to nobody: a throw in a click
+// handler leaves a dead button and no trace anywhere reachable. Every error
+// route out of the frame therefore ends here, and goes to the host.
+//
+// This block sits after the module script in the document but runs before it:
+// a `type=module` script is deferred, a classic inline one is not. So the
+// reporter exists by the time a load-time throw looks for it.
+window.__atomicReportError = function (error, phase) {{
+  if (!window.parent) return;
+
+  var message = error && error.message ? error.message : String(error);
+
+  window.parent.postMessage({{
+    type: '__atomic_plugin_error',
+    phase: phase || 'runtime',
+    message: message,
+    // The stack names the line, which is the difference between "it broke"
+    // and a fix. It describes only the app's own source, which its author is
+    // already allowed to read.
+    stack: error && error.stack ? String(error.stack) : undefined,
+  }}, '*');
+}};
+
+window.addEventListener('error', function (e) {{
+  window.__atomicReportError(e.error || e.message, 'runtime');
+}});
+
+// A rejected promise nobody caught is the common shape here: the host refuses
+// a write the app is not allowed to make, and an app that never awaited the
+// refusal simply does nothing with no explanation.
+window.addEventListener('unhandledrejection', function (e) {{
+  window.__atomicReportError(e.reason, 'runtime');
+}});
+
+window.addEventListener('message', function (e) {{
+  if (e.source !== window.parent) return;
+  if (e.data && e.data.type === '__atomic_style') {{
+    var s = document.getElementById('__atomic_theme');
+    if (s) s.textContent = e.data.css;
+  }}
+}});
+if (window.parent) window.parent.postMessage({{ type: '__atomic_plugin_ready' }}, '*');
+</script>
+</head>
+<body><div id="root"></div></body>
+</html>"#
+    )
+}
+
+/// Retrieves the UI js script for the plugin.
+/// It exepcts two query parameters: drive and plugin (namespace.name)
+#[tracing::instrument(skip(appstate, req))]
+pub async fn handle_plugin_ui(
+    _path: Option<web::Path<String>>,
+    appstate: web::Data<AppState>,
+    query: web::Query<PluginUiQuery>,
+    req: actix_web::HttpRequest,
+) -> AtomicServerResult<HttpResponse> {
+    let drive_subject = &query.drive;
+    let plugin_name = &query.plugin;
+    let format = &query.format;
+
+    // A plugin whose source is in the drive: the token is what stands in for
+    // the signature the iframe cannot produce.
+    if is_subject(plugin_name) {
+        let token = query.token.as_deref().unwrap_or_default();
+
+        if !appstate
+            .view_tokens
+            .admits(token, drive_subject, plugin_name, atomic_lib::utils::now())
+        {
+            // Deliberately not "expired" versus "wrong plugin" versus "never
+            // existed": the caller holding a token is the only one who needs
+            // to know, and they can just mint another.
+            return Ok(HttpResponse::Unauthorized()
+                .body("This plugin view needs a valid, unexpired token."));
+        }
+
+        return serve_drive_plugin(&appstate, plugin_name, format, req.query_string()).await;
+    }
+
+    let (namespace, name) = match split_plugin_name(plugin_name) {
+        Ok(parts) => parts,
+        Err(e) => return Ok(HttpResponse::BadRequest().body(e.message)),
+    };
+
+    // `html` is generated (not a file on disk): serve the iframe host document
+    // with its own CSP so the plugin script isn't blocked by the parent CSP.
+    if format == "html" {
+        let nonce = plugin_nonce();
+        let body = render_plugin_ui_html(&nonce);
+        let csp = frame_csp(&nonce);
+
+        return Ok(HttpResponse::Ok()
+            .content_type("text/html; charset=utf-8")
+            .insert_header(("Content-Security-Policy", csp))
+            .body(body));
+    }
+
+    // The JS/CSS is served to whoever may read the plugin resource itself,
+    // as the same agent that fetches the page — signed headers or the
+    // session cookie, like any other handler.
+    let store = &appstate.store;
+    let for_agent = get_client_agent_for_signed_url(&req, &appstate).await?;
+    let Some(meta) = store.get_plugin_meta(&PluginMetaKey::new(drive_subject, namespace, name))?
+    else {
+        return Ok(HttpResponse::NotFound().body("Plugin UI file not found"));
+    };
+    let plugin_resource = store
+        .get_resource(&Subject::from(meta.subject.as_str()))
+        .await?;
+    atomic_lib::hierarchy::check_read(store, &plugin_resource, &for_agent).await?;
+
+    // No path in the body: the plugin's layout is not the caller's business.
+    let Some(content) = release_file(&appstate, &plugin_resource, format).await? else {
+        return Ok(HttpResponse::NotFound().body("Plugin UI file not found"));
+    };
+
+    let content_type = match format.as_str() {
+        "js" => "application/javascript",
+        "css" => "text/css",
+        _ => return Err("Invalid format".into()),
+    };
+
+    Ok(HttpResponse::Ok()
+        .content_type(content_type)
+        .insert_header((header::ACCESS_CONTROL_ALLOW_ORIGIN, "*"))
+        .body(content))
+}
+
+/// The CSP of every plugin and app frame. A frame holds drive data, so it may
+/// not send it anywhere: `connect-src 'none'`, and images and fonts only from
+/// this server and `data:` (plus `blob:` images): a remote URL can carry data
+/// in its query. The one legitimate request, to the integration proxy, is made by
+/// the host (`proxyFetch`). A frame can still navigate itself to another URL;
+/// no CSP directive stops that, see `planning/host-abi.md`. `allow-modals`
+/// mirrors the iframe's own `sandbox` attribute; the CSP can only narrow it.
+fn frame_csp(nonce: &str) -> String {
+    format!(
+        "sandbox allow-scripts allow-modals allow-downloads allow-pointer-lock allow-presentation; \
+         default-src 'none'; script-src 'nonce-{nonce}'; style-src 'unsafe-inline' 'self'; \
+         img-src 'self' data: blob:; connect-src 'none'; font-src 'self' data:; base-uri 'none'; object-src 'none';"
+    )
+}
+
+/// Serves a plugin whose source is a property on a resource.
+///
+/// The bytes come from the store instead of `plugin_path`; everything else —
+/// the null-origin iframe, its own CSP, the nonce — is unchanged, because none
+/// of that depended on where the source was kept.
+///
+/// Read as Sudo, having already checked the token: the rights question was
+/// settled when the token was minted, against the agent who asked for it. The
+/// iframe is not an agent and has nothing of its own to check.
+async fn serve_drive_plugin(
+    appstate: &AppState,
+    plugin: &str,
+    format: &str,
+    query_string: &str,
+) -> AtomicServerResult<HttpResponse> {
+    if format == "html" {
+        let nonce = plugin_nonce();
+        // No stylesheet: a plugin in the drive is one module. Its styles belong
+        // in it, next to the markup they describe.
+        let body = render_drive_plugin_ui_html_with(query_string, false, &nonce, true);
+        let csp = frame_csp(&nonce);
+
+        return Ok(HttpResponse::Ok()
+            .content_type("text/html; charset=utf-8")
+            .insert_header(("Content-Security-Policy", csp))
+            .body(body));
+    }
+
+    // The data API the view is handed. Embedded rather than generated, so it
+    // stays a real JS file that can be linted and read.
+    if format == "client" {
+        return Ok(HttpResponse::Ok()
+            .content_type("application/javascript")
+            .insert_header((header::ACCESS_CONTROL_ALLOW_ORIGIN, "*"))
+            .body(include_str!("../../assets_tmp/view-client.js")));
+    }
+
+    if format != "js" {
+        return Err(AtomicServerError::bad_request(
+            "A plugin stored in the drive is served as one module",
+        ));
+    }
+
+    let resource = appstate
+        .store
+        .get_resource(&plugin.into())
+        .await
+        .map_err(|e| format!("{plugin} could not be read: {e}"))?;
+
+    let source = source_of(appstate, &resource)
+        .await
+        .ok_or_else(|| AtomicServerError::bad_request("This plugin has no source"))?;
+
+    Ok(HttpResponse::Ok()
+        .content_type("application/javascript")
+        .insert_header((header::ACCESS_CONTROL_ALLOW_ORIGIN, "*"))
+        .body(source))
+}
+
+/// A plugin's source, found through the drive's own vocabulary.
+///
+/// `plugin-source` is created per drive, so its subject is not a constant the
+/// server can hold — the same reason the scheduler resolves it this way. The
+/// plugin's parent may be the drive, or an app that sits on the drive, so walk
+/// up until something answers with an ontology.
+async fn source_of(appstate: &AppState, resource: &atomic_lib::Resource) -> Option<String> {
+    // Two hops covers plugin → app → drive. More than that is a hierarchy
+    // nobody built on purpose, and an unbounded walk here is a cycle away from
+    // hanging the request.
+    let mut subject = resource.get(urls::PARENT).ok()?.to_string();
+
+    for _ in 0..3 {
+        if let Some(terms) = crate::plugins::scheduler::drive_terms(&appstate.store, &subject).await
+        {
+            if let Some(property) = terms.property("plugin-source") {
+                return resource.get(property).ok().map(|value| value.to_string());
+            }
+        }
+
+        let parent = appstate
+            .store
+            .get_resource(&subject.as_str().into())
+            .await
+            .ok()?;
+        subject = parent.get(urls::PARENT).ok()?.to_string();
+    }
+
+    None
+}
+
+/// Lists the UI plugins on a drive that the requesting agent may read. The
+/// list used to be built as `Sudo`, which showed every plugin on the drive
+/// to anyone who asked.
+pub async fn handle_plugin_list(
+    _path: Option<web::Path<String>>,
+    appstate: web::Data<AppState>,
+    query: web::Query<UIPluginListQuery>,
+    req: actix_web::HttpRequest,
+) -> AtomicServerResult<HttpResponse> {
+    let store = &appstate.store;
+    let drive_subject = &query.drive;
+
+    let for_agent = get_client_agent_for_signed_url(&req, &appstate).await?;
+
+    let plugins = store.get_class_extenders_on_drive(drive_subject);
+    let mut plugin_list: Vec<UIPluginListItem> = vec![];
+
+    for plugin in plugins {
+        let Some(subject) = plugin.subject else {
+            continue;
+        };
+
+        let resource = match store
+            .get_resource_extended(&subject.into(), true, &for_agent)
+            .await
+        {
+            Ok(response) => response.to_single(),
+            Err(e) => {
+                tracing::debug!("plugin-list: skipping plugin {}: {}", for_agent, e);
+                continue;
+            }
+        };
+
+        let Ok(Value::String(name)) = resource.get(urls::NAME) else {
+            continue;
+        };
+
+        let Ok(Value::String(namespace)) = resource.get(urls::NAMESPACE) else {
+            continue;
+        };
+
+        let plugin_name = format!("{}.{}", namespace, name);
+
+        let Some(meta) =
+            store.get_plugin_meta(&PluginMetaKey::new(drive_subject, namespace, name))?
+        else {
+            tracing::warn!("Plugin {} has no metadata", plugin_name);
+            continue;
+        };
+
+        if release_file(&appstate, &resource, "js").await?.is_none() {
+            continue;
+        }
+
+        plugin_list.push(UIPluginListItem {
+            plugin: plugin_name,
+            classes: plugin.classes,
+            ui_manifest: PluginUIManifest {
+                css: release_file(&appstate, &resource, "css").await?.is_some(),
+            },
+            resource: meta.subject,
+        });
+    }
+
+    Ok(HttpResponse::Ok().json(plugin_list))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A frame can read drive data, so it must have no way to send it out.
+    #[test]
+    fn frame_csp_forbids_network_and_sandboxes() {
+        let csp = frame_csp("n0nce");
+
+        assert!(csp.contains("connect-src 'none'"));
+        assert!(!csp.contains("connect-src *"));
+        assert!(csp.contains("img-src 'self' data: blob:;"));
+        assert!(csp.contains("font-src 'self' data:;"));
+        assert!(csp.starts_with("sandbox allow-scripts "));
+        assert!(csp.contains("script-src 'nonce-n0nce'"));
+    }
+
+    /// The browser draws the same frame itself when there is no server
+    /// (`appFrameDocument.ts`); its shell and CSP must not drift from ours.
+    const APP_FRAME_TS: &str =
+        include_str!("../../../browser/data-browser/src/chunks/AppPage/appFrameDocument.ts");
+
+    #[test]
+    fn browser_frame_shell_matches() {
+        let html = render_drive_plugin_ui_html_with("format=html", false, "n0nce", true);
+
+        for part in [
+            "type: '__atomic_plugin_rendered'",
+            "type: '__atomic_plugin_error'",
+            "type: '__atomic_plugin_ready'",
+            "'__atomic_style'",
+            "window.addEventListener('unhandledrejection'",
+        ] {
+            assert!(html.contains(part), "server frame lacks {part}");
+            assert!(
+                APP_FRAME_TS.contains(part),
+                "appFrameDocument.ts lacks {part}"
+            );
+        }
+    }
+
+    /// Directives as `name -> value` pairs, `'self'` and `sandbox` left out.
+    fn csp_directives(csp: &str) -> Vec<(String, String)> {
+        let mut out: Vec<_> = csp
+            .split(';')
+            .filter_map(|d| d.trim().split_once(' '))
+            .filter(|(name, _)| *name != "sandbox")
+            .map(|(name, value)| {
+                (
+                    name.to_string(),
+                    value.replace("'self'", "").trim().to_string(),
+                )
+            })
+            .collect();
+        out.sort();
+        out
+    }
+
+    #[test]
+    fn browser_frame_csp_matches() {
+        // The `'name': value,` lines of `frameCspDirectives`, each value a
+        // single string literal.
+        let ts = APP_FRAME_TS
+            .split("function frameCspDirectives")
+            .nth(1)
+            .unwrap();
+        let ts = ts.split("\n}\n").next().unwrap();
+        let ours = ts
+            .lines()
+            .filter_map(|l| l.trim().strip_suffix(',')?.split_once(": "))
+            .map(|(name, v)| {
+                // Strip the JS string quotes around each value.
+                let v = v[1..v.len() - 1].replace("${nonce}", "N");
+                (name.trim_matches('\'').to_string(), v)
+            })
+            .collect::<Vec<_>>();
+        let server = csp_directives(&frame_csp("N"));
+
+        // The srcdoc imports its sources through blob URLs and has no server to
+        // be 'self' of; `form-action` is ours alone (the sandbox has no forms).
+        let expect = |name: &str, value: &str| {
+            let found = ours
+                .iter()
+                .find(|(n, _)| n == name)
+                .map(|(_, v)| v.as_str());
+            assert_eq!(found, Some(value), "{name}");
+        };
+        expect("script-src", "'nonce-N' blob:");
+        expect("form-action", "'none'");
+
+        let mut ours: Vec<_> = ours
+            .into_iter()
+            .filter(|(n, _)| n != "script-src" && n != "form-action")
+            .collect();
+        ours.sort();
+        let server: Vec<_> = server
+            .into_iter()
+            .filter(|(n, _)| n != "script-src")
+            .collect();
+
+        assert_eq!(ours, server);
+    }
+
+    /// An app's frame is null-origin, so its console is reachable by nobody:
+    /// whatever it prints there, the person who could fix the app never sees.
+    /// Every way out of the frame therefore has to end in a message to the
+    /// host, and these are the three ways out.
+    #[test]
+    fn every_route_out_of_a_broken_app_reaches_the_host() {
+        let html = render_drive_plugin_ui_html_with("format=html", false, "n0nce", true);
+
+        // Threw while opening.
+        assert!(html.contains("window.__atomicReportError(e, 'load')"));
+        // Threw while being used — the dead button.
+        assert!(html.contains("window.addEventListener('error'"));
+        // Refused by the host and never awaited, which is what a write outside
+        // the app's own subtree looks like from in there.
+        assert!(html.contains("window.addEventListener('unhandledrejection'"));
+
+        assert!(html.contains("'__atomic_plugin_error'"));
+    }
+
+    /// Success has to be reported too. Without it, "no error yet" is the only
+    /// evidence a caller has, and that is indistinguishable from a frame that
+    /// is still loading — or one that rendered nothing at all.
+    #[test]
+    fn an_app_that_worked_says_so_and_says_how_much_it_drew() {
+        let html = render_drive_plugin_ui_html_with("format=html", false, "n0nce", true);
+
+        assert!(html.contains("'__atomic_plugin_rendered'"));
+        assert!(html.contains("root.childElementCount"));
+    }
+
+    /// The reporter is declared after the module script in the document but has
+    /// to exist before it runs, which it does only because `type=module` defers
+    /// and a classic inline script does not. Reordering these silently loses
+    /// every load-time error.
+    #[test]
+    fn the_reporter_is_defined_by_the_time_a_load_error_looks_for_it() {
+        let html = render_drive_plugin_ui_html_with("format=html", false, "n0nce", true);
+
+        let reporter = html
+            .find("window.__atomicReportError = function")
+            .expect("reporter is defined");
+
+        // Which <script> does it live in? The one that opens last before it.
+        let opening = html[..reporter]
+            .rfind("<script")
+            .expect("the reporter is inside a script tag");
+        let tag_end = html[opening..]
+            .find('>')
+            .map(|i| opening + i)
+            .expect("that script tag is closed");
+
+        assert!(
+            !html[opening..tag_end].contains("type=\"module\""),
+            "the reporter must stay in a classic script. A module defers, so \
+             moving it there would leave load-time throws with nothing to call."
+        );
+    }
+}

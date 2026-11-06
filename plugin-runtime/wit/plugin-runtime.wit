@@ -1,0 +1,41 @@
+package atomic:plugin-runtime@0.1.0;
+
+interface host {
+  /// Invoke a named action on an explicitly referenced integration. Writes only prepare review.
+  invoke-action: func(request: string) -> result<string, string>;
+
+  /// Machine-readable failure of an ABI function; `code` is one of the
+  /// stable codes of `atomic:host` (`atomic-host/wit/host.wit`).
+  record error {
+    code: string,
+    message: string,
+  }
+
+  /**
+  One function of the host ABI (`atomic:host`), by its WIT name:
+  `store.get`, `store.get-many`, `store.query`, `net.fetch`, `calls.providers`,
+  `calls.describe`, `calls.call`. `net.fetch` also takes the older URL form
+  `{method, url, headers, body}` that `ctx.http` sends. `args` is a JSON array of the positional
+  arguments, the result a JSON value. One entry point rather than one import
+  per function, so the ABI can grow without a new runtime build.
+  */
+  abi: func(function: string, args: string) -> result<string, error>;
+}
+
+world plugin-runtime {
+  import host;
+
+  /**
+  Runs a plugin.
+
+  `source` is the plugin's JavaScript and `input` its RunInput as JSON; the
+  result is the verdict as JSON. Both cross as strings on purpose: the browser
+  runner already serializes the verdict, so one shape covers both placements
+  and the ABI stays small enough to read.
+
+  The script is data. One component runs every plugin, so there is no per-plugin
+  build, and promoting a plugin from the browser to the server is a placement
+  decision rather than a toolchain event.
+  */
+  export run: func(source: string, input: string) -> result<string, string>;
+}
