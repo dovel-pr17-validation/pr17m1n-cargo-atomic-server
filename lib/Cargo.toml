@@ -107,7 +107,7 @@ version = "0.32"
 tokio = { version = "1.52.3", features = ["time"] }
 
 [target.'cfg(target_os = "android")'.dependencies]
-rustls-native-certs = "0.8"
+rustls-native-certs = "0.8.5"
 
 [features]
 config = ["directories", "toml"]
