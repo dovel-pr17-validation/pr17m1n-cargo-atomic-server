@@ -15,7 +15,7 @@ web-time = "1"
 # in atomic-saas) — deriving a KEK from a recovery code/password. Pure Rust,
 # no OS RNG dependency in the low-level `hash_password_into` API used here,
 # so it compiles for wasm32 like the rest of this crate's WASM-facing code.
-argon2 = "0.5"
+argon2 = "0.6.0"
 base64 = "0.22"
 rmp-serde = { version = "1.3.1", optional = true }
 # Needed for migration to messagepack
